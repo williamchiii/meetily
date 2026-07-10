@@ -12,11 +12,22 @@ interface SidebarItem {
   title: string;
   type: 'folder' | 'file';
   children?: SidebarItem[];
+  created_at?: string;
 }
 
 export interface CurrentMeeting {
   id: string;
   title: string;
+  created_at?: string;
+  updated_at?: string;
+  folder_id?: string | null;
+}
+
+export interface Folder {
+  id: string;
+  name: string;
+  created_at: string;
+  meeting_count: number;
 }
 
 // Search result type for transcript search
@@ -33,6 +44,11 @@ interface SidebarContextType {
   sidebarItems: SidebarItem[];
   isCollapsed: boolean;
   toggleCollapse: () => void;
+  // Resizable sidebar (expanded width in px, persisted)
+  sidebarWidth: number;
+  setSidebarWidth: (width: number) => void;
+  isResizingSidebar: boolean;
+  setIsResizingSidebar: (resizing: boolean) => void;
   meetings: CurrentMeeting[];
   setMeetings: (meetings: CurrentMeeting[]) => void;
   isMeetingActive: boolean;
@@ -51,10 +67,20 @@ interface SidebarContextType {
   stopSummaryPolling: (meetingId: string) => void;
   // Refetch meetings from backend
   refetchMeetings: () => Promise<void>;
-
+  // Organizational folders
+  folders: Folder[];
+  refetchFolders: () => Promise<void>;
+  createFolder: (name: string) => Promise<Folder | null>;
+  renameFolder: (folderId: string, name: string) => Promise<boolean>;
+  deleteFolder: (folderId: string) => Promise<boolean>;
+  moveMeetingToFolder: (meetingId: string, folderId: string | null) => Promise<boolean>;
 }
 
 const SidebarContext = createContext<SidebarContextType | null>(null);
+
+const SIDEBAR_WIDTH_KEY = 'meetily-sidebar-width';
+const SIDEBAR_WIDTH_DEFAULT = 256;
+const clampSidebarWidth = (width: number) => Math.min(420, Math.max(200, width));
 
 export const useSidebar = () => {
   const context = useContext(SidebarContext);
@@ -67,7 +93,24 @@ export const useSidebar = () => {
 export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const [currentMeeting, setCurrentMeeting] = useState<CurrentMeeting | null>({ id: 'intro-call', title: '+ New Call' });
   const [isCollapsed, setIsCollapsed] = useState(true);
+  const [sidebarWidth, setSidebarWidthState] = useState<number>(() => {
+    if (typeof window === 'undefined') return SIDEBAR_WIDTH_DEFAULT;
+    const stored = Number(window.localStorage.getItem(SIDEBAR_WIDTH_KEY));
+    return Number.isFinite(stored) && stored > 0 ? clampSidebarWidth(stored) : SIDEBAR_WIDTH_DEFAULT;
+  });
+  const [isResizingSidebar, setIsResizingSidebar] = useState(false);
+
+  const setSidebarWidth = React.useCallback((width: number) => {
+    const clamped = clampSidebarWidth(width);
+    setSidebarWidthState(clamped);
+    try {
+      window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(clamped));
+    } catch {
+      // Persistence is best-effort
+    }
+  }, []);
   const [meetings, setMeetings] = useState<CurrentMeeting[]>([]);
+  const [folders, setFolders] = useState<Folder[]>([]);
   const [sidebarItems, setSidebarItems] = useState<SidebarItem[]>([]);
   const [isMeetingActive, setIsMeetingActive] = useState(false);
   const [searchResults, setSearchResults] = useState<any[]>([]);
@@ -86,10 +129,13 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const fetchMeetings = React.useCallback(async () => {
     if (serverAddress) {
       try {
-        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string }>;
+        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string, created_at: string, updated_at: string, folder_id: string | null }>;
         const transformedMeetings = meetings.map((meeting: any) => ({
           id: meeting.id,
-          title: meeting.title
+          title: meeting.title,
+          created_at: meeting.created_at,
+          updated_at: meeting.updated_at,
+          folder_id: meeting.folder_id ?? null
         }));
         setMeetings(transformedMeetings);
         Analytics.trackBackendConnection(true);
@@ -105,6 +151,68 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     fetchMeetings();
   }, [serverAddress, fetchMeetings]);
 
+  // Organizational folders: fetch + CRUD helpers
+  const fetchFolders = React.useCallback(async () => {
+    try {
+      const result = await invoke('api_get_folders') as Folder[];
+      setFolders(result);
+    } catch (error) {
+      console.error('Error fetching folders:', error);
+      setFolders([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchFolders();
+  }, [fetchFolders]);
+
+  const createFolder = React.useCallback(async (name: string): Promise<Folder | null> => {
+    try {
+      const folder = await invoke('api_create_folder', { name }) as Folder;
+      await fetchFolders();
+      return folder;
+    } catch (error) {
+      console.error('Error creating folder:', error);
+      return null;
+    }
+  }, [fetchFolders]);
+
+  const renameFolder = React.useCallback(async (folderId: string, name: string): Promise<boolean> => {
+    try {
+      await invoke('api_rename_folder', { folderId, name });
+      await fetchFolders();
+      return true;
+    } catch (error) {
+      console.error('Error renaming folder:', error);
+      return false;
+    }
+  }, [fetchFolders]);
+
+  const deleteFolder = React.useCallback(async (folderId: string): Promise<boolean> => {
+    try {
+      await invoke('api_delete_folder', { folderId });
+      // Meetings in the folder become unfiled; keep local state in sync
+      setMeetings(prev => prev.map(m => m.folder_id === folderId ? { ...m, folder_id: null } : m));
+      await fetchFolders();
+      return true;
+    } catch (error) {
+      console.error('Error deleting folder:', error);
+      return false;
+    }
+  }, [fetchFolders]);
+
+  const moveMeetingToFolder = React.useCallback(async (meetingId: string, folderId: string | null): Promise<boolean> => {
+    try {
+      await invoke('api_set_meeting_folder', { meetingId, folderId });
+      setMeetings(prev => prev.map(m => m.id === meetingId ? { ...m, folder_id: folderId } : m));
+      await fetchFolders();
+      return true;
+    } catch (error) {
+      console.error('Error moving meeting to folder:', error);
+      return false;
+    }
+  }, [fetchFolders]);
+
   useEffect(() => {
     const fetchSettings = async () => {
       setServerAddress('http://localhost:5167');
@@ -119,7 +227,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       title: 'Meeting Notes',
       type: 'folder' as const,
       children: [
-        ...meetings.map(meeting => ({ id: meeting.id, title: meeting.title, type: 'file' as const }))
+        ...meetings.map(meeting => ({ id: meeting.id, title: meeting.title, type: 'file' as const, created_at: meeting.created_at }))
       ]
     },
   ];
@@ -296,6 +404,10 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       sidebarItems,
       isCollapsed,
       toggleCollapse,
+      sidebarWidth,
+      setSidebarWidth,
+      isResizingSidebar,
+      setIsResizingSidebar,
       meetings,
       setMeetings,
       isMeetingActive,
@@ -312,7 +424,12 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       startSummaryPolling,
       stopSummaryPolling,
       refetchMeetings: fetchMeetings,
-
+      folders,
+      refetchFolders: fetchFolders,
+      createFolder,
+      renameFolder,
+      deleteFolder,
+      moveMeetingToFolder,
     }}>
       {children}
     </SidebarContext.Provider>

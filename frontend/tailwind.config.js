@@ -25,8 +25,17 @@ module.exports = {
   theme: {
   	extend: {
   		fontFamily: {
+  			// SF Pro on Apple platforms via the system stack; sensible fallbacks elsewhere
   			sans: [
-  				'var(--font-source-sans-3)'
+  				'-apple-system',
+  				'BlinkMacSystemFont',
+  				'"SF Pro Text"',
+  				'"SF Pro Display"',
+  				'"Segoe UI"',
+  				'Roboto',
+  				'Helvetica',
+  				'Arial',
+  				'sans-serif'
   			]
   		},
   		colors: {
@@ -37,6 +46,8 @@ module.exports = {
   			ring: 'hsl(var(--ring))',
   			// Raised panel surface (dark equivalent of the old `bg-white` cards/sidebar)
   			surface: '#262624',
+  			// Sidebar sits slightly darker than the #262624 canvas/panels
+  			sidebar: '#212121',
   			// Granola-style warm dark theme: the stock light-mode ramps are remapped so
   			// existing classes keep their *semantic* role on a dark canvas.
   			// Low shades (50-300) stay dark (fills/borders), high shades (400-900)
