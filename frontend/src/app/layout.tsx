@@ -7,7 +7,7 @@ import MainContent from '@/components/MainContent'
 import AnalyticsProvider from '@/components/AnalyticsProvider'
 import { Toaster, toast } from 'sonner'
 import "sonner/dist/styles.css"
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, Suspense } from 'react'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { TooltipProvider } from '@/components/ui/tooltip'
@@ -245,7 +245,12 @@ export default function RootLayout({
                                 <OnboardingFlow onComplete={handleOnboardingComplete} />
                               ) : (
                                 <div className="flex">
-                                  <Sidebar />
+                                  {/* Suspense: Sidebar reads useSearchParams (folder
+                                      highlighting), which requires a boundary above it
+                                      for static-export prerendering of every route */}
+                                  <Suspense fallback={null}>
+                                    <Sidebar />
+                                  </Suspense>
                                   <MainContent>{children}</MainContent>
                                 </div>
                               )}
