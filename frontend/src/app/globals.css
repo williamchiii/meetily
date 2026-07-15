@@ -271,3 +271,63 @@
 .bn-shadcn.bn-shadcn .bn-editor {
   background-color: transparent;
 }
+
+/* Markdown rendering for assistant messages in the Chat tab
+   (no typography plugin in this project, so style the elements directly) */
+.chat-markdown > *:first-child {
+  margin-top: 0;
+}
+.chat-markdown p,
+.chat-markdown ul,
+.chat-markdown ol,
+.chat-markdown pre,
+.chat-markdown blockquote,
+.chat-markdown table {
+  margin: 0.5rem 0;
+}
+.chat-markdown h1,
+.chat-markdown h2,
+.chat-markdown h3,
+.chat-markdown h4 {
+  font-weight: 600;
+  margin: 0.75rem 0 0.25rem;
+}
+.chat-markdown h1 { font-size: 1.125rem; }
+.chat-markdown h2 { font-size: 1.0625rem; }
+.chat-markdown h3 { font-size: 1rem; }
+.chat-markdown ul { list-style: disc; padding-left: 1.25rem; }
+.chat-markdown ol { list-style: decimal; padding-left: 1.25rem; }
+.chat-markdown li { margin: 0.125rem 0; }
+.chat-markdown code {
+  background: #35352F;
+  border-radius: 0.25rem;
+  padding: 0.1rem 0.3rem;
+  font-size: 0.85em;
+}
+.chat-markdown pre {
+  background: #35352F;
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+  overflow-x: auto;
+}
+.chat-markdown pre code {
+  background: transparent;
+  padding: 0;
+}
+.chat-markdown blockquote {
+  border-left: 3px solid #41413A;
+  padding-left: 0.75rem;
+  color: #A4A499;
+}
+.chat-markdown a {
+  color: #6FA0FF;
+  text-decoration: underline;
+}
+.chat-markdown table {
+  border-collapse: collapse;
+}
+.chat-markdown th,
+.chat-markdown td {
+  border: 1px solid #41413A;
+  padding: 0.25rem 0.5rem;
+}

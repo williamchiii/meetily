@@ -1,8 +1,21 @@
 use crate::api::{TranscriptSearchResult, TranscriptSegment};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::{Connection, Error as SqlxError, SqlitePool};
 use tracing::{error, info};
 use uuid::Uuid;
+
+/// When the meeting started, derived from the recording-relative timestamps of
+/// its segments: segments carry audio_start/end_time in seconds from recording
+/// start, and saving happens at recording stop - so start = stop - recording
+/// length. Falls back to `now` when segments carry no audio timestamps.
+fn meeting_start_time(now: DateTime<Utc>, transcripts: &[TranscriptSegment]) -> DateTime<Utc> {
+    let recording_seconds = transcripts
+        .iter()
+        .filter_map(|t| t.audio_end_time.or(t.audio_start_time))
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .fold(0.0f64, f64::max);
+    now - chrono::Duration::milliseconds((recording_seconds * 1000.0) as i64)
+}
 
 pub struct TranscriptsRepository;
 
@@ -22,6 +35,8 @@ impl TranscriptsRepository {
         let mut transaction = conn.begin().await?;
 
         let now = Utc::now();
+        // Date the meeting from when recording STARTED, not when it was saved
+        let created_at = meeting_start_time(now, transcripts);
 
         // 1. Create the new meeting
         let result = sqlx::query(
@@ -29,7 +44,7 @@ impl TranscriptsRepository {
         )
         .bind(&meeting_id)
         .bind(meeting_title)
-        .bind(now)
+        .bind(created_at)
         .bind(now)
         .bind(&folder_path)
         .execute(&mut *transaction)
@@ -142,5 +157,48 @@ impl TranscriptsRepository {
             }
             None => transcript.chars().take(200).collect(), // Fallback to the start of the transcript
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segment(audio_start: Option<f64>, audio_end: Option<f64>) -> TranscriptSegment {
+        TranscriptSegment {
+            id: "t1".to_string(),
+            text: "hello".to_string(),
+            timestamp: "14:30:05".to_string(),
+            audio_start_time: audio_start,
+            audio_end_time: audio_end,
+            duration: None,
+        }
+    }
+
+    #[test]
+    fn meeting_start_time_subtracts_recording_length() {
+        let now = Utc::now();
+        let transcripts = vec![
+            segment(Some(0.0), Some(12.5)),
+            segment(Some(60.0), Some(90.0)),
+            segment(Some(1800.0), Some(1845.5)),
+        ];
+        let start = meeting_start_time(now, &transcripts);
+        assert_eq!((now - start).num_milliseconds(), 1_845_500);
+    }
+
+    #[test]
+    fn meeting_start_time_falls_back_to_now_without_audio_times() {
+        let now = Utc::now();
+        assert_eq!(meeting_start_time(now, &[]), now);
+        assert_eq!(meeting_start_time(now, &[segment(None, None)]), now);
+    }
+
+    #[test]
+    fn meeting_start_time_ignores_invalid_values() {
+        let now = Utc::now();
+        let transcripts = vec![segment(Some(f64::NAN), Some(-5.0)), segment(None, Some(30.0))];
+        let start = meeting_start_time(now, &transcripts);
+        assert_eq!((now - start).num_milliseconds(), 30_000);
     }
 }

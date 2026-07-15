@@ -199,10 +199,14 @@ pub fn get_available_models() -> Vec<ModelDef> {
             template: "qwen3.5_nonthinking".to_string(),
             download_url: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf".to_string(),
             size_mb: 5417,
-            context_size: 32768,
+            // 8K context, not 32K: the ~5.4GB of weights already dominate a
+            // 16GB machine, and a 32K KV/compute allocation on top pushes
+            // macOS into swap. Long transcripts are chunked to fit (service.rs
+            // derives the chunking threshold from this value).
+            context_size: 8192,
             layer_count: 32,
             sampling: SamplingParams::qwen35_summary(vec!["<|im_end|>".to_string()]),
-            description: "Largest Qwen 3.5 model for built-in summaries. Best quality; needs ~6GB free RAM, recommended for Apple Silicon or 16GB+ machines.".to_string(),
+            description: "Largest Qwen 3.5 model. Best quality but memory-hungry (~6GB resident while generating) - expect system slowdown on 16GB machines; most comfortable with 24GB+.".to_string(),
         },
         // Gemma 3 4B - Legacy alternative retained for users who prefer Gemma output.
         ModelDef {
@@ -370,7 +374,7 @@ mod tests {
             "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf"
         );
         assert_eq!(qwen_9b.size_mb, 5417);
-        assert_eq!(qwen_9b.context_size, 32768);
+        assert_eq!(qwen_9b.context_size, 8192);
         assert_eq!(qwen_9b.layer_count, 32);
         assert_eq!(qwen_9b.sampling, SamplingParams::qwen35_summary(vec!["<|im_end|>".to_string()]));
 

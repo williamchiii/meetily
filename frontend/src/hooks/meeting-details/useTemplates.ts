@@ -9,7 +9,7 @@ export function useTemplates() {
     name: string;
     description: string;
   }>>([]);
-  const [selectedTemplate, setSelectedTemplate] = useState<string>('granola');
+  const [selectedTemplate, setSelectedTemplate] = useState<string>('granola_2');
 
   // Fetch available templates on mount
   useEffect(() => {

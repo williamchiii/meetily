@@ -100,6 +100,13 @@ pub struct Setting {
     #[sqlx(rename = "customOpenAIConfig")]
     #[serde(rename = "customOpenAIConfig")]
     pub custom_openai_config: Option<String>,
+    /// Chat-specific model override; NULL falls back to provider/model
+    #[sqlx(rename = "chatProvider")]
+    #[serde(rename = "chatProvider")]
+    pub chat_provider: Option<String>,
+    #[sqlx(rename = "chatModel")]
+    #[serde(rename = "chatModel")]
+    pub chat_model: Option<String>,
 }
 
 impl Setting {

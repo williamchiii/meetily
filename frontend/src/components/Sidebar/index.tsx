@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
-import { File, Settings, Home, Trash2, Mic, Square, Pencil, NotebookPen, SearchIcon, X, Upload, Folder as FolderIcon, FolderPlus, PanelLeft } from 'lucide-react';
+import { File, Settings, Home, Trash2, Mic, Square, Pencil, NotebookPen, SearchIcon, X, Upload, Folder as FolderIcon, FolderPlus, PanelLeft, MessageCircle } from 'lucide-react';
 import { useRouter, usePathname, useSearchParams } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
 import { ConfirmationModal } from '../ConfirmationModel/confirmation-modal';
@@ -489,6 +489,15 @@ const Sidebar: React.FC = () => {
                     >
                       <NotebookPen className="w-4 h-4 mr-2" />
                       <span>All Notes</span>
+                    </div>
+
+                    {/* Chat */}
+                    <div
+                      onClick={() => router.push('/chat')}
+                      className={`px-3 text-sm font-medium text-gray-700 items-center h-9 flex mx-3 mt-1 rounded-lg cursor-pointer ${pathname === '/chat' ? 'bg-gray-100' : 'hover:bg-gray-100'}`}
+                    >
+                      <MessageCircle className="w-4 h-4 mr-2" />
+                      <span>Chat</span>
                     </div>
 
                     {/* Virtual folder for meetings that have not been assigned to a folder */}
