@@ -1,13 +1,16 @@
 /// Chat module - answers user questions about their meetings.
 ///
-/// Retrieves relevant meeting summaries and transcript excerpts via keyword
-/// search over the local database, then asks the configured summarization LLM
-/// (built-in sidecar, Ollama, or a cloud provider) to answer grounded in that
-/// context.
+/// Retrieval combines three signals, all local: keyword search over
+/// transcripts and titles (with neighbor-segment windows), saved AI
+/// summaries, and - when an Ollama embedding model is reachable - semantic
+/// search over embedded transcript chunks. The prompt budget scales with the
+/// context window of whichever model answers: the chat-specific model if one
+/// is configured, otherwise the summary model.
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use log::{error, info};
+use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -15,9 +18,12 @@ use tauri::{AppHandle, Manager, Runtime};
 
 use crate::{
     database::repositories::setting::SettingsRepository,
+    ollama::metadata::ModelMetadataCache,
     state::AppState,
     summary::llm_client::{generate_summary, LLMProvider},
 };
+
+pub(crate) mod embeddings;
 
 /// One prior turn of the conversation, sent from the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +46,12 @@ pub struct ChatResponse {
     pub sources: Vec<ChatSource>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ChatModelConfig {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
 // Question words and filler that would match almost every transcript segment.
 const STOPWORDS: &[&str] = &[
     "the", "and", "for", "that", "this", "these", "those", "with", "what", "when", "where",
@@ -54,17 +66,27 @@ const STOPWORDS: &[&str] = &[
     "explain", "more", "info", "information", "detail", "details", "latest", "recent",
 ];
 
-/// Per-meeting retrieval limits keep the prompt inside every model's context.
 const MAX_KEYWORDS: usize = 8;
-const MAX_SEGMENTS_PER_MEETING: usize = 6;
-const MAX_CONTEXT_MEETINGS: usize = 4;
-const MAX_SUMMARY_CHARS_PER_MEETING: usize = 1500;
-const MAX_CHARS_PER_MEETING: usize = 2000;
-const MAX_TOTAL_CONTEXT_CHARS: usize = 9000;
+const MAX_CONTEXT_MEETINGS: usize = 5;
+/// Segments of context pulled in around every keyword-matched segment.
+const WINDOW_RADIUS: usize = 2;
+/// Most segments a single meeting contributes excerpts from.
+const MAX_SEGMENTS_LOADED: i64 = 800;
 const MAX_HISTORY_MESSAGES: usize = 6;
 const MAX_HISTORY_CHARS_PER_MESSAGE: usize = 1000;
 const RECENT_MEETINGS_LISTED: i64 = 12;
-const FALLBACK_TRANSCRIPT_SEGMENTS: i64 = 40;
+/// Rough chars-per-token used to convert model context windows into prompt
+/// character budgets; 3 is conservative for English + transcription noise.
+const CHARS_PER_TOKEN: usize = 3;
+/// Tokens reserved for the system prompt, question, history, scaffolding, and
+/// generation headroom before the rest of the window is given to context.
+const RESERVED_TOKENS: usize = 2000;
+const MIN_CONTEXT_CHARS: usize = 9_000;
+const MAX_CONTEXT_CHARS: usize = 80_000;
+
+/// Ollama context sizes are fetched per model and cached briefly.
+static CHAT_METADATA_CACHE: Lazy<ModelMetadataCache> =
+    Lazy::new(|| ModelMetadataCache::new(Duration::from_secs(300)));
 
 fn extract_keywords(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -103,97 +125,164 @@ fn escape_like_pattern(keyword: &str) -> String {
         .replace('_', "\\_")
 }
 
-struct MeetingHits {
+/// Convert a model context window (tokens) into a prompt character budget.
+fn context_chars_for_tokens(context_tokens: usize) -> usize {
+    (context_tokens.saturating_sub(RESERVED_TOKENS) * CHARS_PER_TOKEN)
+        .clamp(MIN_CONTEXT_CHARS, MAX_CONTEXT_CHARS)
+}
+
+/// Resolve how many characters of meeting context the answering model can take.
+async fn resolve_context_budget(
+    provider: &LLMProvider,
+    model_name: &str,
+    ollama_endpoint: Option<&str>,
+) -> usize {
+    let tokens = match provider {
+        LLMProvider::BuiltInAI => {
+            crate::summary::summary_engine::models::get_model_by_name(model_name)
+                .map(|m| m.context_size as usize)
+                .unwrap_or(8192)
+        }
+        LLMProvider::Ollama => CHAT_METADATA_CACHE
+            .get_or_fetch(model_name, ollama_endpoint)
+            .await
+            .map(|m| m.context_size)
+            .unwrap_or(8192),
+        LLMProvider::CustomOpenAI => 16_384,
+        // Hosted frontier models: cap by cost/latency, not by their windows.
+        LLMProvider::Claude
+        | LLMProvider::OpenAI
+        | LLMProvider::Groq
+        | LLMProvider::OpenRouter => 32_768,
+    };
+    context_chars_for_tokens(tokens)
+}
+
+#[derive(Default)]
+struct MeetingContext {
     title: String,
     created_at: String,
-    keywords: HashSet<String>,
-    segments: Vec<String>,
+    keyword_count: usize,
+    hit_count: i64,
+    semantic_score: f32,
+    excerpt: String,
+    semantic_chunks: Vec<String>,
     summary: Option<String>,
 }
 
-/// Search transcripts AND meeting titles for each keyword and group the
-/// matching segments by meeting, ranked by distinct keywords matched.
-async fn retrieve_context(
+/// Stage 1 of keyword retrieval: rank meetings by how many distinct keywords
+/// they match (in transcript text or title) without fetching transcript rows.
+async fn rank_meetings_by_keywords(
     pool: &SqlitePool,
     keywords: &[String],
-) -> Result<Vec<(String, MeetingHits)>, String> {
-    let mut hits: HashMap<String, MeetingHits> = HashMap::new();
+) -> Result<Vec<(String, MeetingContext)>, String> {
+    let mut ranked: HashMap<String, MeetingContext> = HashMap::new();
 
     for keyword in keywords {
         let pattern = format!("%{}%", escape_like_pattern(keyword));
-        let rows = sqlx::query_as::<_, (String, String, String, String)>(
-            "SELECT m.id, m.title, m.created_at, t.transcript
+        let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT m.id, m.title, m.created_at, COUNT(t.rowid)
              FROM meetings m
              JOIN transcripts t ON m.id = t.meeting_id
              WHERE LOWER(t.transcript) LIKE ?1 ESCAPE '\\'
                 OR LOWER(m.title) LIKE ?1 ESCAPE '\\'
+             GROUP BY m.id, m.title, m.created_at
              ORDER BY m.created_at DESC
-             LIMIT 100",
+             LIMIT 50",
         )
         .bind(&pattern)
         .fetch_all(pool)
         .await
         .map_err(|e| format!("Transcript search failed: {}", e))?;
 
-        for (id, title, created_at, transcript) in rows {
-            let entry = hits.entry(id).or_insert_with(|| MeetingHits {
+        for (id, title, created_at, hits) in rows {
+            let entry = ranked.entry(id).or_insert_with(|| MeetingContext {
                 title,
                 created_at,
-                keywords: HashSet::new(),
-                segments: Vec::new(),
-                summary: None,
+                ..Default::default()
             });
-            entry.keywords.insert(keyword.clone());
-            let segment = transcript.trim().to_string();
-            if !segment.is_empty()
-                && entry.segments.len() < MAX_SEGMENTS_PER_MEETING
-                && !entry.segments.contains(&segment)
-            {
-                entry.segments.push(segment);
-            }
+            entry.keyword_count += 1;
+            entry.hit_count += hits;
         }
     }
 
-    let mut ranked: Vec<(String, MeetingHits)> = hits.into_iter().collect();
+    let mut ranked: Vec<(String, MeetingContext)> = ranked.into_iter().collect();
     ranked.sort_by(|a, b| {
-        b.1.keywords
-            .len()
-            .cmp(&a.1.keywords.len())
-            .then_with(|| b.1.segments.len().cmp(&a.1.segments.len()))
+        b.1.keyword_count
+            .cmp(&a.1.keyword_count)
+            .then_with(|| b.1.hit_count.cmp(&a.1.hit_count))
             .then_with(|| b.1.created_at.cmp(&a.1.created_at))
     });
-    ranked.truncate(MAX_CONTEXT_MEETINGS);
     Ok(ranked)
 }
 
-/// Fallback when keyword search finds nothing (e.g. "what was my meeting
-/// today about?"): ground the answer in the most recent meeting.
-async fn load_recent_meeting_hits(
-    pool: &SqlitePool,
-    meeting_id: &str,
-    title: &str,
-    created_at: &str,
-) -> Result<MeetingHits, String> {
-    let rows = sqlx::query_as::<_, (String,)>(
+/// Stage 2: build a windowed excerpt for one meeting - every segment matching
+/// a keyword plus WINDOW_RADIUS segments around it, gaps marked with […].
+/// With no keyword matches (title match / recency fallback) the head of the
+/// meeting is used instead.
+fn select_windows(segments: &[String], keywords: &[String], max_chars: usize) -> String {
+    if segments.is_empty() || max_chars == 0 {
+        return String::new();
+    }
+    let lower_keywords: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
+    let mut include = vec![false; segments.len()];
+    let mut any_match = false;
+
+    if !lower_keywords.is_empty() {
+        for (i, segment) in segments.iter().enumerate() {
+            let lower = segment.to_lowercase();
+            if lower_keywords.iter().any(|k| lower.contains(k)) {
+                any_match = true;
+                let start = i.saturating_sub(WINDOW_RADIUS);
+                let end = (i + WINDOW_RADIUS).min(segments.len() - 1);
+                for flag in include.iter_mut().take(end + 1).skip(start) {
+                    *flag = true;
+                }
+            }
+        }
+    }
+    if !any_match {
+        for flag in include.iter_mut() {
+            *flag = true;
+        }
+    }
+
+    let mut out = String::new();
+    let mut previous_included = true;
+    for (i, segment) in segments.iter().enumerate() {
+        if out.chars().count() >= max_chars {
+            break;
+        }
+        if include[i] {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+                if !previous_included {
+                    out.push_str("[…]\n");
+                }
+            }
+            out.push_str(segment);
+            previous_included = true;
+        } else {
+            previous_included = false;
+        }
+    }
+    truncate_chars(&out, max_chars)
+}
+
+async fn load_segments(pool: &SqlitePool, meeting_id: &str) -> Result<Vec<String>, String> {
+    let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT transcript FROM transcripts WHERE meeting_id = ? ORDER BY rowid LIMIT ?",
     )
     .bind(meeting_id)
-    .bind(FALLBACK_TRANSCRIPT_SEGMENTS)
+    .bind(MAX_SEGMENTS_LOADED)
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("Failed to load recent meeting transcript: {}", e))?;
-
-    Ok(MeetingHits {
-        title: title.to_string(),
-        created_at: created_at.to_string(),
-        keywords: HashSet::new(),
-        segments: rows
-            .into_iter()
-            .map(|(t,)| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect(),
-        summary: None,
-    })
+    .map_err(|e| format!("Failed to load transcript: {}", e))?;
+    Ok(rows.into_iter().map(|(s,)| s).collect())
 }
 
 /// Pull the saved AI summary for a meeting, as plain text, if one exists.
@@ -275,7 +364,8 @@ fn build_user_prompt(
     today: &str,
     history: &[ChatMessage],
     recents: &[(String, String, String)],
-    context: &[(String, MeetingHits)],
+    context: &[(String, MeetingContext)],
+    total_budget_chars: usize,
 ) -> String {
     let mut prompt = String::new();
 
@@ -292,33 +382,41 @@ fn build_user_prompt(
     prompt.push_str("\n## Meeting details relevant to the question\n");
     if context.is_empty() {
         prompt.push_str("(nothing matched the question)\n");
-    }
-    let mut used_chars = 0usize;
-    for (_, meeting) in context {
-        if used_chars >= MAX_TOTAL_CONTEXT_CHARS {
-            break;
-        }
-        prompt.push_str(&format!(
-            "### {} ({})\n",
-            meeting.title,
-            date_only(&meeting.created_at)
-        ));
+    } else {
+        // Split the budget across meetings; a lone meeting gets everything.
+        let per_meeting = total_budget_chars / context.len().max(1);
+        for (_, meeting) in context {
+            prompt.push_str(&format!(
+                "### {} ({})\n",
+                meeting.title,
+                date_only(&meeting.created_at)
+            ));
 
-        if let Some(summary) = &meeting.summary {
-            let budget =
-                MAX_SUMMARY_CHARS_PER_MEETING.min(MAX_TOTAL_CONTEXT_CHARS - used_chars);
-            let text = truncate_chars(summary, budget);
-            used_chars += text.chars().count();
-            prompt.push_str(&format!("Saved summary:\n{}\n", text));
-        }
+            let mut remaining = per_meeting;
+            if let Some(summary) = &meeting.summary {
+                // Summaries are dense: give them up to half the meeting's share.
+                let summary_budget = remaining / 2;
+                let text = truncate_chars(summary, summary_budget);
+                remaining = remaining.saturating_sub(text.chars().count());
+                prompt.push_str(&format!("Saved summary:\n{}\n", text));
+            }
 
-        if !meeting.segments.is_empty() && used_chars < MAX_TOTAL_CONTEXT_CHARS {
-            let budget = MAX_CHARS_PER_MEETING.min(MAX_TOTAL_CONTEXT_CHARS - used_chars);
-            let text = truncate_chars(&meeting.segments.join("\n"), budget);
-            used_chars += text.chars().count();
-            prompt.push_str(&format!("Transcript excerpts:\n{}\n", text));
+            let mut transcript_parts: Vec<&str> = Vec::new();
+            if !meeting.excerpt.is_empty() {
+                transcript_parts.push(meeting.excerpt.as_str());
+            }
+            for chunk in &meeting.semantic_chunks {
+                // Skip semantic chunks already covered by the keyword excerpt
+                if !meeting.excerpt.contains(chunk.as_str()) {
+                    transcript_parts.push(chunk.as_str());
+                }
+            }
+            if !transcript_parts.is_empty() && remaining > 0 {
+                let text = truncate_chars(&transcript_parts.join("\n[…]\n"), remaining);
+                prompt.push_str(&format!("Transcript excerpts:\n{}\n", text));
+            }
+            prompt.push('\n');
         }
-        prompt.push('\n');
     }
 
     if !history.is_empty() {
@@ -345,8 +443,50 @@ const SYSTEM_PROMPT: &str = "You are Meetily's meeting assistant. Answer the use
 the meeting list, saved summaries, and transcript excerpts provided. Prefer saved summaries for \
 overviews and transcript excerpts for specifics; ground every claim in that context and refer to \
 meetings by their title and date. Use today's date to resolve words like 'today' or 'last week'. \
-Transcripts are raw speech-to-text, so tolerate transcription errors. If the context does not \
-contain the answer, say so plainly instead of guessing. Be concise and answer in Markdown.";
+Transcripts are raw speech-to-text, so tolerate transcription errors; [\u{2026}] marks skipped \
+passages. If the context does not contain the answer, say so plainly instead of guessing. Be \
+concise and answer in Markdown.";
+
+/// The model that answers chat: the chat-specific override when configured,
+/// otherwise the summary model.
+fn resolve_chat_model(setting: &crate::database::models::Setting) -> (String, String) {
+    match (&setting.chat_provider, &setting.chat_model) {
+        (Some(provider), Some(model))
+            if !provider.trim().is_empty() && !model.trim().is_empty() =>
+        {
+            (provider.clone(), model.clone())
+        }
+        _ => (setting.provider.clone(), setting.model.clone()),
+    }
+}
+
+#[tauri::command]
+pub async fn api_get_chat_model_config(
+    state: tauri::State<'_, AppState>,
+) -> Result<ChatModelConfig, String> {
+    let setting = SettingsRepository::get_model_config(state.db_manager.pool())
+        .await
+        .map_err(|e| format!("Failed to load settings: {}", e))?;
+    Ok(ChatModelConfig {
+        provider: setting.as_ref().and_then(|s| s.chat_provider.clone()),
+        model: setting.as_ref().and_then(|s| s.chat_model.clone()),
+    })
+}
+
+#[tauri::command]
+pub async fn api_save_chat_model_config(
+    state: tauri::State<'_, AppState>,
+    provider: Option<String>,
+    model: Option<String>,
+) -> Result<(), String> {
+    SettingsRepository::save_chat_model_config(
+        state.db_manager.pool(),
+        provider.as_deref().filter(|p| !p.trim().is_empty()),
+        model.as_deref().filter(|m| !m.trim().is_empty()),
+    )
+    .await
+    .map_err(|e| format!("Failed to save chat model config: {}", e))
+}
 
 #[tauri::command]
 pub async fn chat_ask<R: Runtime>(
@@ -362,56 +502,138 @@ pub async fn chat_ask<R: Runtime>(
     let history = history.unwrap_or_default();
     let pool = state.db_manager.pool();
 
-    // 1. Retrieve grounding context from the local database.
-    let keywords = gather_keywords(&question, &history);
-    info!("chat_ask keywords: {:?}", keywords);
-    let mut context = if keywords.is_empty() {
-        Vec::new()
-    } else {
-        retrieve_context(pool, &keywords).await?
-    };
-    let recents = recent_meetings(pool).await?;
-
-    // Nothing matched (or the question was all stopwords, e.g. "what was my
-    // meeting today about?") - ground in the most recent meeting instead.
-    if context.is_empty() {
-        if let Some((id, title, created_at)) = recents.first() {
-            let fallback = load_recent_meeting_hits(pool, id, title, created_at).await?;
-            context.push((id.clone(), fallback));
-        }
-    }
-
-    // Attach saved AI summaries - the densest context available per meeting.
-    for (id, meeting) in context.iter_mut() {
-        meeting.summary = fetch_summary_text(pool, id).await;
-    }
-
-    // 2. Resolve the configured LLM (same source of truth as summaries).
+    // Resolve the answering model first - the retrieval budget depends on it.
     let setting = SettingsRepository::get_model_config(pool)
         .await
         .map_err(|e| format!("Failed to load model settings: {}", e))?
         .ok_or_else(|| {
             "No summarization model configured. Pick one in Settings first.".to_string()
         })?;
-    let provider = LLMProvider::from_str(&setting.provider)?;
-    let model_name = setting.model.clone();
+    let (provider_name, model_name) = resolve_chat_model(&setting);
+    let provider = LLMProvider::from_str(&provider_name)?;
     if model_name.trim().is_empty() {
         return Err("No model selected. Pick one in Settings first.".to_string());
     }
 
+    let client = Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let budget_chars = resolve_context_budget(
+        &provider,
+        &model_name,
+        setting.ollama_endpoint.as_deref(),
+    )
+    .await;
+
+    // 1. Retrieve grounding context: keywords + semantic search in parallel.
+    let keywords = gather_keywords(&question, &history);
+    info!(
+        "chat_ask model={}:{} budget={} chars keywords={:?}",
+        provider_name, model_name, budget_chars, keywords
+    );
+
+    let (keyword_ranked, semantic_hits) = tokio::join!(
+        async {
+            if keywords.is_empty() {
+                Ok(Vec::new())
+            } else {
+                rank_meetings_by_keywords(pool, &keywords).await
+            }
+        },
+        embeddings::semantic_candidates(
+            pool,
+            &client,
+            setting.ollama_endpoint.as_deref(),
+            &question
+        )
+    );
+    let keyword_ranked = keyword_ranked?;
+    if !semantic_hits.is_empty() {
+        info!(
+            "chat_ask semantic hits: {:?}",
+            semantic_hits
+                .iter()
+                .map(|h| (&h.title, h.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Merge: meetings found by both signals rank first, then semantic-only
+    // (by score), then keyword-only (already ranked).
+    let mut context: Vec<(String, MeetingContext)> = Vec::new();
+    let keyword_ids: HashSet<String> = keyword_ranked.iter().map(|(id, _)| id.clone()).collect();
+    for (id, mut meeting) in keyword_ranked {
+        if let Some(hit) = semantic_hits.iter().find(|h| h.meeting_id == id) {
+            meeting.semantic_score = hit.score;
+            meeting.semantic_chunks = hit.chunks.clone();
+        }
+        context.push((id, meeting));
+    }
+    context.sort_by(|a, b| {
+        let both_a = (a.1.semantic_score > 0.0) as u8 + (a.1.keyword_count > 0) as u8;
+        let both_b = (b.1.semantic_score > 0.0) as u8 + (b.1.keyword_count > 0) as u8;
+        both_b
+            .cmp(&both_a)
+            .then_with(|| b.1.keyword_count.cmp(&a.1.keyword_count))
+            .then_with(|| b.1.hit_count.cmp(&a.1.hit_count))
+    });
+    for hit in semantic_hits {
+        if !keyword_ids.contains(&hit.meeting_id) {
+            context.push((
+                hit.meeting_id.clone(),
+                MeetingContext {
+                    title: hit.title,
+                    created_at: hit.created_at,
+                    semantic_score: hit.score,
+                    semantic_chunks: hit.chunks,
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+    context.truncate(MAX_CONTEXT_MEETINGS);
+
+    let recents = recent_meetings(pool).await?;
+
+    // Nothing matched (or the question was all stopwords, e.g. "what was my
+    // meeting today about?") - ground in the most recent meeting instead.
+    if context.is_empty() {
+        if let Some((id, title, created_at)) = recents.first() {
+            context.push((
+                id.clone(),
+                MeetingContext {
+                    title: title.clone(),
+                    created_at: created_at.clone(),
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+
+    // 2. Build excerpts and attach summaries within the model's budget.
+    let per_meeting_chars = budget_chars / context.len().max(1);
+    for (id, meeting) in context.iter_mut() {
+        let segments = load_segments(pool, id).await?;
+        meeting.excerpt = select_windows(&segments, &keywords, per_meeting_chars);
+        meeting.summary = fetch_summary_text(pool, id).await;
+    }
+
+    // 3. Resolve credentials/endpoints and ask the model.
     let api_key = if provider == LLMProvider::Ollama
         || provider == LLMProvider::BuiltInAI
         || provider == LLMProvider::CustomOpenAI
     {
         String::new()
     } else {
-        match SettingsRepository::get_api_key(pool, &setting.provider).await {
+        match SettingsRepository::get_api_key(pool, &provider_name).await {
             Ok(Some(key)) if !key.is_empty() => key,
-            Ok(_) => return Err(format!("API key not found for {}", setting.provider)),
+            Ok(_) => return Err(format!("API key not found for {}", provider_name)),
             Err(e) => {
                 return Err(format!(
                     "Failed to retrieve API key for {}: {}",
-                    setting.provider, e
+                    provider_name, e
                 ))
             }
         }
@@ -454,13 +676,15 @@ pub async fn chat_ask<R: Runtime>(
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
 
-    // 3. Ask the model.
     let today = chrono::Local::now().format("%Y-%m-%d (%A)").to_string();
-    let user_prompt = build_user_prompt(&question, &today, &history, &recents, &context);
-    let client = Client::builder()
-        .timeout(Duration::from_secs(180))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let user_prompt = build_user_prompt(
+        &question,
+        &today,
+        &history,
+        &recents,
+        &context,
+        budget_chars,
+    );
 
     let answer = generate_summary(
         &client,
@@ -519,15 +743,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_keywords_dedupes_and_caps() {
-        let keywords = extract_keywords(
-            "alpha alpha bravo charlie delta echo foxtrot golf hotel india juliett",
-        );
-        assert_eq!(keywords.len(), MAX_KEYWORDS);
-        assert_eq!(keywords[0], "alpha");
-    }
-
-    #[test]
     fn gather_keywords_falls_back_to_prior_user_turns() {
         let history = vec![
             user_message("What did we decide about the Jiro cadence?"),
@@ -542,16 +757,60 @@ mod tests {
     }
 
     #[test]
-    fn gather_keywords_prefers_current_question() {
-        let history = vec![user_message("tell me about the roadmap")];
-        let keywords = gather_keywords("what about the budget and hiring plan?", &history);
-        assert_eq!(keywords[0], "budget");
-        assert!(keywords.contains(&"hiring".to_string()));
+    fn escape_like_pattern_escapes_wildcards() {
+        assert_eq!(escape_like_pattern("50%_a\\b"), "50\\%\\_a\\\\b");
     }
 
     #[test]
-    fn escape_like_pattern_escapes_wildcards() {
-        assert_eq!(escape_like_pattern("50%_a\\b"), "50\\%\\_a\\\\b");
+    fn context_chars_scale_with_model_window() {
+        // 8K model (qwen3.5:9b): (8192 - 2000) * 3 = 18576
+        assert_eq!(context_chars_for_tokens(8192), 18_576);
+        // 32K model (qwen3.5:4b): (32768 - 2000) * 3 = 92304 -> clamped
+        assert_eq!(context_chars_for_tokens(32_768), MAX_CONTEXT_CHARS);
+        // Tiny/unknown windows never starve retrieval below the floor
+        assert_eq!(context_chars_for_tokens(2048), MIN_CONTEXT_CHARS);
+    }
+
+    #[test]
+    fn select_windows_includes_neighbors_and_marks_gaps() {
+        // Two matches far apart -> two windows with an interior gap between them
+        let segments: Vec<String> = (0..15)
+            .map(|i| {
+                if i == 2 || i == 12 {
+                    format!("budget point {}", i)
+                } else {
+                    format!("segment number {}", i)
+                }
+            })
+            .collect();
+        let windows = select_windows(&segments, &["budget".to_string()], 10_000);
+
+        // Each match brings WINDOW_RADIUS neighbors on both sides
+        assert!(windows.contains("segment number 0"));
+        assert!(windows.contains("budget point 2"));
+        assert!(windows.contains("segment number 4"));
+        assert!(windows.contains("segment number 10"));
+        assert!(windows.contains("budget point 12"));
+        assert!(windows.contains("segment number 14"));
+        // The stretch between the two windows is skipped, with a gap marker
+        assert!(!windows.contains("segment number 7"));
+        assert!(windows.contains("[…]"));
+    }
+
+    #[test]
+    fn select_windows_uses_head_when_no_keyword_matches() {
+        let segments: Vec<String> = (0..5).map(|i| format!("segment {}", i)).collect();
+        let windows = select_windows(&segments, &["nomatch".to_string()], 10_000);
+        assert!(windows.contains("segment 0"));
+        assert!(windows.contains("segment 4"));
+        assert!(!windows.contains("[…]"));
+    }
+
+    #[test]
+    fn select_windows_respects_char_budget() {
+        let segments: Vec<String> = (0..100).map(|i| format!("segment {}", i)).collect();
+        let windows = select_windows(&segments, &[], 120);
+        assert!(windows.chars().count() <= 121); // budget + ellipsis
     }
 
     #[test]
@@ -589,12 +848,12 @@ mod tests {
         )];
         let context = vec![(
             "id1".to_string(),
-            MeetingHits {
+            MeetingContext {
                 title: "Standup".to_string(),
                 created_at: "2026-07-01T10:00:00+00:00".to_string(),
-                keywords: HashSet::new(),
-                segments: vec!["we shipped the roadmap".to_string()],
+                excerpt: "we shipped the roadmap".to_string(),
                 summary: Some("- roadmap shipped".to_string()),
+                ..Default::default()
             },
         )];
         let history = vec![user_message("earlier question")];
@@ -605,6 +864,7 @@ mod tests {
             &history,
             &recents,
             &context,
+            18_000,
         );
 
         assert!(prompt.contains("Today's date: 2026-07-10 (Friday)"));
@@ -614,5 +874,42 @@ mod tests {
         assert!(prompt.contains("Transcript excerpts:\nwe shipped the roadmap"));
         assert!(prompt.contains("User: earlier question"));
         assert!(prompt.contains("## Question\nwhat about the roadmap?"));
+    }
+
+    #[test]
+    fn resolve_chat_model_prefers_override_and_falls_back() {
+        let mut setting = crate::database::models::Setting {
+            id: "1".to_string(),
+            provider: "builtin-ai".to_string(),
+            model: "qwen3.5:4b".to_string(),
+            whisper_model: "large-v3".to_string(),
+            groq_api_key: None,
+            openai_api_key: None,
+            anthropic_api_key: None,
+            ollama_api_key: None,
+            open_router_api_key: None,
+            ollama_endpoint: None,
+            custom_openai_config: None,
+            chat_provider: None,
+            chat_model: None,
+        };
+        assert_eq!(
+            resolve_chat_model(&setting),
+            ("builtin-ai".to_string(), "qwen3.5:4b".to_string())
+        );
+
+        setting.chat_provider = Some("claude".to_string());
+        setting.chat_model = Some("claude-sonnet-5".to_string());
+        assert_eq!(
+            resolve_chat_model(&setting),
+            ("claude".to_string(), "claude-sonnet-5".to_string())
+        );
+
+        // Half-configured override is ignored
+        setting.chat_model = Some("  ".to_string());
+        assert_eq!(
+            resolve_chat_model(&setting),
+            ("builtin-ai".to_string(), "qwen3.5:4b".to_string())
+        );
     }
 }

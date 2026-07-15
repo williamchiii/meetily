@@ -639,6 +639,8 @@ pub fn run() {
             api::api_set_meeting_folder,
             api::api_search_transcripts,
             chat::chat_ask,
+            chat::api_get_chat_model_config,
+            chat::api_save_chat_model_config,
             api::api_get_profile,
             api::api_save_profile,
             api::api_update_profile,

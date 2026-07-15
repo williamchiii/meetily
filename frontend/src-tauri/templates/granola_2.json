@@ -1,0 +1,36 @@
+{
+  "name": "Granola Style 2.0",
+  "description": "Outcome-first meeting notes: summary, topic-grouped discussion points, explicit decisions, verb-first action items, open questions, and next steps. Sections are omitted entirely when the meeting had nothing for them.",
+  "sections": [
+    {
+      "title": "Summary",
+      "instruction": "Write a 2-4 sentence overview of the meeting's purpose and most important outcomes. Lead with outcomes, not the agenda. Omit this section entirely if the meeting was too short to summarize meaningfully.",
+      "format": "paragraph"
+    },
+    {
+      "title": "Key Discussion Points",
+      "instruction": "One bullet per distinct topic, formatted as '- **<Topic>**: <what was discussed, in the terms participants used>'. Group by topic, not chronology. Preserve the participants' original wording for scope and ownership - do not reword for fluency. Omit topics that were only briefly touched on unless they carry decisions or actions.",
+      "format": "list"
+    },
+    {
+      "title": "Decisions",
+      "instruction": "One bullet per decision, formatted as '- <decision> — <who decided / how it was resolved>', including the who/how part only if explicitly stated in the transcript. Only include items explicitly agreed or resolved: a topic being discussed is not a decision. Omit this section entirely if no decisions were made.",
+      "format": "list"
+    },
+    {
+      "title": "Action Items",
+      "instruction": "One checkbox bullet per task, formatted as '- [ ] <action> — <owner> (due: <date>)', where the owner appears only if explicitly named and the due date only if explicitly stated. Never infer owners or deadlines from attendance or context. Phrase each action verb-first as a concrete task. Omit this section entirely if no action items exist.",
+      "format": "list"
+    },
+    {
+      "title": "Open Questions / Follow-ups",
+      "instruction": "One bullet per unresolved question or item explicitly deferred to a future meeting. Include only items explicitly left open in the transcript. Omit this section entirely if there are none.",
+      "format": "list"
+    },
+    {
+      "title": "Next Steps / Next Meeting",
+      "instruction": "State the scheduled follow-up or agreed next checkpoint, if one was mentioned. Omit this section entirely if it was not discussed.",
+      "format": "paragraph"
+    }
+  ]
+}

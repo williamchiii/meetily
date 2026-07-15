@@ -67,6 +67,30 @@ impl SettingsRepository {
         Ok(())
     }
 
+    /// Save the chat-specific model override. Passing None for both clears the
+    /// override so chat falls back to the summary model.
+    pub async fn save_chat_model_config(
+        pool: &SqlitePool,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO settings (id, provider, model, whisperModel, chatProvider, chatModel)
+            VALUES ('1', 'builtin-ai', 'qwen3.5:2b', 'large-v3', $1, $2)
+            ON CONFLICT(id) DO UPDATE SET
+                chatProvider = excluded.chatProvider,
+                chatModel = excluded.chatModel
+            "#,
+        )
+        .bind(provider)
+        .bind(model)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn save_api_key(
         pool: &SqlitePool,
         provider: &str,

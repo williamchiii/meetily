@@ -7,6 +7,24 @@ import { ArrowUp, FileText, Loader2, MessageCircle, Trash2 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { toast } from 'sonner';
+import { BuiltInAIAPI, BuiltInModelInfo, isModelAvailable } from '@/lib/builtin-ai';
+
+interface OllamaModel {
+  name: string;
+  id: string;
+  size: string;
+  modified: string;
+}
+
+interface ChatModelConfig {
+  provider: string | null;
+  model: string | null;
+}
+
+/** '' = use the summary model; otherwise 'provider|model' */
+function toSelectValue(config: ChatModelConfig): string {
+  return config.provider && config.model ? `${config.provider}|${config.model}` : '';
+}
 
 interface ChatSource {
   id: string;
@@ -43,8 +61,41 @@ export default function ChatPage() {
   const [hydrated, setHydrated] = useState(false);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [modelValue, setModelValue] = useState('');
+  const [builtinModels, setBuiltinModels] = useState<BuiltInModelInfo[]>([]);
+  const [ollamaModels, setOllamaModels] = useState<OllamaModel[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Load the chat model override and the locally available model options
+  useEffect(() => {
+    invoke<ChatModelConfig>('api_get_chat_model_config')
+      .then(config => setModelValue(toSelectValue(config)))
+      .catch(error => console.error('Failed to load chat model config:', error));
+
+    BuiltInAIAPI.listModels()
+      .then(models => setBuiltinModels(models.filter(m => isModelAvailable(m.status))))
+      .catch(() => setBuiltinModels([]));
+
+    invoke<OllamaModel[]>('get_ollama_models', { endpoint: null })
+      .then(setOllamaModels)
+      .catch(() => setOllamaModels([]));
+  }, []);
+
+  const handleModelChange = async (value: string) => {
+    const previous = modelValue;
+    setModelValue(value);
+    const [provider, model] = value ? value.split('|') : [null, null];
+    try {
+      await invoke('api_save_chat_model_config', { provider, model });
+      toast.success(value ? `Chat will use ${model}` : 'Chat will use the summary model');
+    } catch (error) {
+      setModelValue(previous);
+      toast.error('Failed to save chat model', {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
 
   // Restore the session's conversation after mount (avoids hydration mismatch
   // with the statically exported empty page)
@@ -116,6 +167,35 @@ export default function ChatPage() {
 
   const isEmpty = messages.length === 0;
 
+  const modelSelector = (
+    <select
+      value={modelValue}
+      onChange={e => handleModelChange(e.target.value)}
+      title="Which model answers chat questions"
+      className="max-w-[220px] truncate text-xs text-gray-500 bg-surface border border-gray-200 rounded-md px-2 py-1 cursor-pointer hover:border-gray-300 focus:outline-none focus:border-blue-400 transition-colors"
+    >
+      <option value="">Model: same as summaries</option>
+      {builtinModels.length > 0 && (
+        <optgroup label="Built-in AI (downloaded)">
+          {builtinModels.map(model => (
+            <option key={model.name} value={`builtin-ai|${model.name}`}>
+              {model.display_name}
+            </option>
+          ))}
+        </optgroup>
+      )}
+      {ollamaModels.length > 0 && (
+        <optgroup label="Ollama">
+          {ollamaModels.map(model => (
+            <option key={model.name} value={`ollama|${model.name}`}>
+              {model.name}
+            </option>
+          ))}
+        </optgroup>
+      )}
+    </select>
+  );
+
   const inputBox = (
     <div className="w-full rounded-2xl border border-gray-300 bg-surface shadow-sm focus-within:border-blue-400 transition-colors">
       <textarea
@@ -155,8 +235,11 @@ export default function ChatPage() {
               Ask anything about your meetings
             </h1>
             {inputBox}
-            <p className="mt-4 text-center text-xs text-gray-400">
-              Answers come from your local meeting transcripts using your configured summary model.
+            <div className="mt-4 flex items-center justify-center gap-3">
+              {modelSelector}
+            </div>
+            <p className="mt-3 text-center text-xs text-gray-400">
+              Answers are grounded in your local meeting summaries and transcripts.
             </p>
           </div>
         </div>
@@ -169,14 +252,17 @@ export default function ChatPage() {
                 <MessageCircle className="w-4 h-4 mr-2" />
                 Chat
               </div>
-              <button
-                onClick={clearChat}
-                className="flex items-center gap-1 text-xs text-gray-400 hover:text-red-500 transition-colors"
-                aria-label="Clear conversation"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                Clear
-              </button>
+              <div className="flex items-center gap-3">
+                {modelSelector}
+                <button
+                  onClick={clearChat}
+                  className="flex items-center gap-1 text-xs text-gray-400 hover:text-red-500 transition-colors"
+                  aria-label="Clear conversation"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Clear
+                </button>
+              </div>
             </div>
           </div>
 
