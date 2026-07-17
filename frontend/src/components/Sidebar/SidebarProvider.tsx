@@ -78,6 +78,9 @@ interface SidebarContextType {
 
 const SidebarContext = createContext<SidebarContextType | null>(null);
 
+/** dataTransfer MIME type for dragging a meeting row onto a sidebar folder */
+export const MEETING_DRAG_TYPE = 'application/x-meetily-meeting';
+
 const SIDEBAR_WIDTH_KEY = 'meetily-sidebar-width';
 const SIDEBAR_WIDTH_DEFAULT = 256;
 const clampSidebarWidth = (width: number) => Math.min(420, Math.max(200, width));

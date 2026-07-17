@@ -7,7 +7,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { File, Folder as FolderIcon, FolderMinus, MoreHorizontal, NotebookPen, Pencil, Trash2 } from 'lucide-react';
 
-import { useSidebar } from '@/components/Sidebar/SidebarProvider';
+import { useSidebar, MEETING_DRAG_TYPE } from '@/components/Sidebar/SidebarProvider';
+import { setInternalDragActive } from '@/lib/internal-drag';
 import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
 import { ConfirmationModal } from '@/components/ConfirmationModel/confirmation-modal';
 import {
@@ -212,8 +213,16 @@ function NotesContent() {
                 return (
                   <div
                     key={meeting.id}
+                    draggable
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData(MEETING_DRAG_TYPE, meeting.id);
+                      e.dataTransfer.effectAllowed = 'move';
+                      setInternalDragActive(true);
+                    }}
+                    onDragEnd={() => setInternalDragActive(false)}
                     onClick={() => openMeeting(meeting)}
-                    className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-gray-100 cursor-pointer group transition-colors"
+                    className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-gray-100 cursor-pointer group transition-colors active:cursor-grabbing"
+                    title="Drag onto a sidebar folder to file this meeting"
                   >
                     <div className="flex-shrink-0 flex items-center justify-center w-9 h-9 rounded-lg bg-gray-100 border border-gray-200">
                       <File className="w-4 h-4 text-gray-500" />
