@@ -544,7 +544,7 @@ const Sidebar: React.FC = () => {
                         onDragOver={(e) => handleMeetingDragOver(e, 'uncategorized')}
                         onDragLeave={handleMeetingDragLeave}
                         onDrop={(e) => handleMeetingDrop(e, null)}
-                        className={`px-3 py-2 my-0.5 rounded-md text-sm flex items-center group cursor-pointer ${dropTargetId === 'uncategorized' ? 'bg-gray-100' : isUncategorizedActive ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
+                        className={`px-3 py-2 my-0.5 rounded-md text-sm flex items-center group cursor-pointer ${dropTargetId === 'uncategorized' ? 'bg-blue-100 text-blue-700 ring-1 ring-blue-400' : isUncategorizedActive ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
                       >
                         <FolderIcon className="w-4 h-4 mr-2 flex-shrink-0" />
                         <span className="flex-1 min-w-0 truncate">Uncategorized</span>
@@ -572,7 +572,7 @@ const Sidebar: React.FC = () => {
                           onDragOver={(e) => handleMeetingDragOver(e, folder.id)}
                           onDragLeave={handleMeetingDragLeave}
                           onDrop={(e) => handleMeetingDrop(e, folder.id)}
-                          className={`px-3 py-2 my-0.5 rounded-md text-sm flex items-center group cursor-pointer ${dropTargetId === folder.id ? 'bg-gray-100' : activeFolderId === folder.id ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
+                          className={`px-3 py-2 my-0.5 rounded-md text-sm flex items-center group cursor-pointer ${dropTargetId === folder.id ? 'bg-blue-100 text-blue-700 ring-1 ring-blue-400' : activeFolderId === folder.id ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
                         >
                           <FolderIcon className="w-4 h-4 mr-2 flex-shrink-0" />
                           <span className="flex-1 min-w-0 truncate">{folder.name}</span>
