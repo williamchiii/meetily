@@ -24,7 +24,6 @@ import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcess
 import { ImportAudioDialog, ImportDropOverlay } from '@/components/ImportAudio'
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
-import { isInternalDragActive } from '@/lib/internal-drag'
 
 
 // Module-level component — stable reference across RootLayout re-renders.
@@ -158,11 +157,8 @@ export default function RootLayout({
     const cleanedUpRef = { current: false };
 
     const setupListeners = async () => {
-      // Drag enter/over - show overlay only if beta feature is enabled.
-      // Skip in-app drags (filing meetings into folders) that macOS also
-      // reports as OS-level drags.
+      // Drag enter/over - show overlay only if beta feature is enabled
       const unlistenDragEnter = await listen('tauri://drag-enter', () => {
-        if (isInternalDragActive()) return;
         if (loadBetaFeatures().importAndRetranscribe) {
           setShowDropOverlay(true);
         }

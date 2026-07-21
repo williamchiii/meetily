@@ -3,7 +3,7 @@
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { File, Settings, Home, Trash2, Mic, Square, Pencil, NotebookPen, SearchIcon, X, Upload, Folder as FolderIcon, FolderPlus, PanelLeft, MessageCircle } from 'lucide-react';
 import { useRouter, usePathname, useSearchParams } from 'next/navigation';
-import { useSidebar, MEETING_DRAG_TYPE } from './SidebarProvider';
+import { useSidebar } from './SidebarProvider';
 import { ConfirmationModal } from '../ConfirmationModel/confirmation-modal';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { SettingTabs } from '../SettingTabs';
@@ -50,7 +50,6 @@ const Sidebar: React.FC = () => {
     createFolder,
     renameFolder,
     deleteFolder,
-    moveMeetingToFolder,
     serverAddress
   } = useSidebar();
 
@@ -72,42 +71,6 @@ const Sidebar: React.FC = () => {
     model: 'parakeet-tdt-0.6b-v3-int8',
   });
   const [settingsSaveSuccess, setSettingsSaveSuccess] = useState<boolean | null>(null);
-
-  // Drag-and-drop filing: meeting rows dropped onto folder rows below.
-  // Tracks which folder row ('uncategorized' or a folder id) is hovered.
-  const [dropTargetId, setDropTargetId] = useState<string | null>(null);
-
-  const handleMeetingDragOver = (e: React.DragEvent, targetId: string) => {
-    if (!e.dataTransfer.types.includes(MEETING_DRAG_TYPE)) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    if (dropTargetId !== targetId) setDropTargetId(targetId);
-  };
-
-  const handleMeetingDragLeave = (e: React.DragEvent) => {
-    // Ignore transitions into the row's own children
-    if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) {
-      setDropTargetId(null);
-    }
-  };
-
-  const handleMeetingDrop = async (e: React.DragEvent, folderId: string | null) => {
-    e.preventDefault();
-    setDropTargetId(null);
-    const meetingId = e.dataTransfer.getData(MEETING_DRAG_TYPE);
-    if (!meetingId) return;
-
-    const meeting = meetings.find(m => m.id === meetingId);
-    if (meeting && (meeting.folder_id ?? null) === folderId) return; // already there
-
-    const ok = await moveMeetingToFolder(meetingId, folderId);
-    if (ok) {
-      const name = folderId ? folders.find(f => f.id === folderId)?.name : null;
-      toast.success(name ? `Moved to ${name}` : 'Removed from folder');
-    } else {
-      toast.error('Failed to move meeting');
-    }
-  };
 
   // Folder nav state (Granola-style sidebar)
   const [activeFolderId, setActiveFolderId] = useState<string | null>(null);
@@ -541,10 +504,7 @@ const Sidebar: React.FC = () => {
                     <div className="mx-3 mt-1">
                       <div
                         onClick={openUncategorized}
-                        onDragOver={(e) => handleMeetingDragOver(e, 'uncategorized')}
-                        onDragLeave={handleMeetingDragLeave}
-                        onDrop={(e) => handleMeetingDrop(e, null)}
-                        className={`px-3 py-2 my-0.5 rounded-md text-sm flex items-center group cursor-pointer ${dropTargetId === 'uncategorized' ? 'bg-blue-100 text-blue-700 ring-1 ring-blue-400' : isUncategorizedActive ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
+                        className={`px-3 py-2 my-0.5 rounded-md text-sm flex items-center group cursor-pointer ${isUncategorizedActive ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
                       >
                         <FolderIcon className="w-4 h-4 mr-2 flex-shrink-0" />
                         <span className="flex-1 min-w-0 truncate">Uncategorized</span>
@@ -569,10 +529,7 @@ const Sidebar: React.FC = () => {
                         <div
                           key={folder.id}
                           onClick={() => openFolder(folder.id)}
-                          onDragOver={(e) => handleMeetingDragOver(e, folder.id)}
-                          onDragLeave={handleMeetingDragLeave}
-                          onDrop={(e) => handleMeetingDrop(e, folder.id)}
-                          className={`px-3 py-2 my-0.5 rounded-md text-sm flex items-center group cursor-pointer ${dropTargetId === folder.id ? 'bg-blue-100 text-blue-700 ring-1 ring-blue-400' : activeFolderId === folder.id ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
+                          className={`px-3 py-2 my-0.5 rounded-md text-sm flex items-center group cursor-pointer ${activeFolderId === folder.id ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
                         >
                           <FolderIcon className="w-4 h-4 mr-2 flex-shrink-0" />
                           <span className="flex-1 min-w-0 truncate">{folder.name}</span>
