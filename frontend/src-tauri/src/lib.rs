@@ -699,6 +699,8 @@ pub fn run() {
             audio::recording_preferences::get_current_audio_backend,
             audio::recording_preferences::set_audio_backend,
             audio::recording_preferences::get_audio_backend_info,
+            // Call detection (auto-stop when the meeting call ends)
+            audio::call_detector::get_call_detection_support,
             // Language preference commands
             set_language_preference,
             // Notification system commands

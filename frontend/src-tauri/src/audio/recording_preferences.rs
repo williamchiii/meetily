@@ -20,9 +20,16 @@ pub struct RecordingPreferences {
     pub preferred_mic_device: Option<String>,
     #[serde(default)]
     pub preferred_system_device: Option<String>,
+    /// Stop the recording automatically once the meeting call it belongs to ends.
+    #[serde(default = "default_auto_stop_on_call_end")]
+    pub auto_stop_on_call_end: bool,
     #[cfg(target_os = "macos")]
     #[serde(default)]
     pub system_audio_backend: Option<String>,
+}
+
+fn default_auto_stop_on_call_end() -> bool {
+    true
 }
 
 impl Default for RecordingPreferences {
@@ -33,6 +40,7 @@ impl Default for RecordingPreferences {
             file_format: "mp4".to_string(),
             preferred_mic_device: None,
             preferred_system_device: None,
+            auto_stop_on_call_end: default_auto_stop_on_call_end(),
             #[cfg(target_os = "macos")]
             system_audio_backend: Some("coreaudio".to_string()),
         }
@@ -128,9 +136,9 @@ pub async fn load_recording_preferences<R: Runtime>(
         RecordingPreferences::default()
     };
 
-    info!("Loaded recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}",
+    info!("Loaded recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}, auto_stop_on_call_end={}",
           prefs.save_folder, prefs.auto_save, prefs.file_format,
-          prefs.preferred_mic_device, prefs.preferred_system_device);
+          prefs.preferred_mic_device, prefs.preferred_system_device, prefs.auto_stop_on_call_end);
     Ok(prefs)
 }
 
@@ -139,9 +147,9 @@ pub async fn save_recording_preferences<R: Runtime>(
     app: &AppHandle<R>,
     preferences: &RecordingPreferences,
 ) -> Result<()> {
-    info!("Saving recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}",
+    info!("Saving recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}, auto_stop_on_call_end={}",
           preferences.save_folder, preferences.auto_save, preferences.file_format,
-          preferences.preferred_mic_device, preferences.preferred_system_device);
+          preferences.preferred_mic_device, preferences.preferred_system_device, preferences.auto_stop_on_call_end);
 
     // Get or create store
     let store = app

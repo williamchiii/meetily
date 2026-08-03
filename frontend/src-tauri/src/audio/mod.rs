@@ -35,6 +35,7 @@ pub mod system_detector;
 pub mod system_audio_commands;
 pub mod device_monitor;  // NEW: Device disconnect/reconnect monitoring
 pub mod playback_monitor; // NEW: Playback device detection for BT warnings
+pub mod call_detector;   // NEW: Auto-stop recording when the call ends
 
 // Transcription module (provider abstraction, engine management, worker pool)
 pub mod transcription;
@@ -100,6 +101,9 @@ pub use encode::{
     encode_single_audio, AudioInput
 };
 pub use device_monitor::{AudioDeviceMonitor, DeviceEvent, DeviceMonitorType};
+
+// Export call detection (auto-stop when the meeting call ends)
+pub use call_detector::{get_call_detection_support, CallDetectionSupport, CallProbe};
 
 // Export device detection and diagnostics
 pub use device_detection::{InputDeviceKind, calculate_buffer_timeout};
