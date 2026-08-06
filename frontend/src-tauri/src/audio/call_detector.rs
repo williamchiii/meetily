@@ -91,10 +91,69 @@ pub fn stop() {
 // WATCHER
 // ============================================================================
 
+/// What a poll concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchAction {
+    /// Keep watching.
+    Wait,
+    /// A call has been up long enough to trust; auto-stop is now live.
+    Arm,
+    /// The call is gone for good - stop the recording.
+    Stop,
+}
+
+/// The arm-then-stop timing, kept apart from the polling loop so it can be driven
+/// with synthetic time in tests.
+#[derive(Debug, Default)]
+pub struct WatchState {
+    armed: bool,
+    seen_since: Option<Instant>,
+    gone_since: Option<Instant>,
+}
+
+impl WatchState {
+    /// Fold one observation into the state and say what to do about it.
+    pub fn observe(&mut self, now: Instant, call_active: bool) -> WatchAction {
+        if call_active {
+            self.gone_since = None;
+
+            if self.armed {
+                return WatchAction::Wait;
+            }
+
+            let seen_since = *self.seen_since.get_or_insert(now);
+            if now.duration_since(seen_since) >= ARM_AFTER {
+                self.armed = true;
+                return WatchAction::Arm;
+            }
+
+            return WatchAction::Wait;
+        }
+
+        self.seen_since = None;
+
+        // Never stop a recording that has not yet seen a call: an in-person meeting
+        // looks exactly like a call that ended 20 seconds ago.
+        if !self.armed {
+            return WatchAction::Wait;
+        }
+
+        let gone_since = *self.gone_since.get_or_insert(now);
+        if now.duration_since(gone_since) >= END_GRACE {
+            WatchAction::Stop
+        } else {
+            WatchAction::Wait
+        }
+    }
+
+    /// Forget everything seen so far, for when auto-stop is switched off mid-recording.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 async fn watch<R: Runtime>(app: AppHandle<R>, cancel: Arc<AtomicBool>) {
-    let mut armed = false;
-    let mut call_seen_since: Option<Instant> = None;
-    let mut call_gone_since: Option<Instant> = None;
+    let mut state = WatchState::default();
     let mut last_apps: Vec<String> = Vec::new();
 
     loop {
@@ -116,9 +175,7 @@ async fn watch<R: Runtime>(app: AppHandle<R>, cancel: Arc<AtomicBool>) {
         // Re-read the preference every poll so toggling the setting takes effect
         // during an in-flight recording.
         if !auto_stop_enabled(&app).await {
-            armed = false;
-            call_seen_since = None;
-            call_gone_since = None;
+            state.reset();
             continue;
         }
 
@@ -145,44 +202,31 @@ async fn watch<R: Runtime>(app: AppHandle<R>, cancel: Arc<AtomicBool>) {
             return;
         }
 
-        if apps.is_empty() {
-            call_seen_since = None;
-
-            if !armed {
-                continue;
-            }
-
-            let gone_since = *call_gone_since.get_or_insert_with(Instant::now);
-            if gone_since.elapsed() < END_GRACE {
-                continue;
-            }
-
-            info!(
-                "📞 Call ended ({}), stopping recording automatically",
-                last_apps.join(", ")
-            );
-
-            // Detach before stopping: `stop_recording` cancels the watcher, and we do
-            // not want the flag we are about to set to abort our own stop sequence.
-            detach(&cancel);
-            auto_stop(&app, &last_apps).await;
-            return;
+        if !apps.is_empty() {
+            last_apps = apps.clone();
         }
 
-        call_gone_since = None;
-        last_apps = apps;
+        match state.observe(Instant::now(), !apps.is_empty()) {
+            WatchAction::Wait => continue,
+            WatchAction::Arm => {
+                info!(
+                    "📞 Call detected ({}), recording will stop automatically when it ends",
+                    last_apps.join(", ")
+                );
+            }
+            WatchAction::Stop => {
+                info!(
+                    "📞 Call ended ({}), stopping recording automatically",
+                    last_apps.join(", ")
+                );
 
-        if armed {
-            continue;
-        }
-
-        let seen_since = *call_seen_since.get_or_insert_with(Instant::now);
-        if seen_since.elapsed() >= ARM_AFTER {
-            armed = true;
-            info!(
-                "📞 Call detected ({}), recording will stop automatically when it ends",
-                last_apps.join(", ")
-            );
+                // Detach before stopping: `stop_recording` cancels the watcher, and we
+                // do not want the flag we are about to set to abort our own stop
+                // sequence.
+                detach(&cancel);
+                auto_stop(&app, &last_apps).await;
+                return;
+            }
         }
     }
 }
@@ -406,7 +450,15 @@ fn probe_windows() -> CallProbe {
         return CallProbe::Unsupported("microphone consent store is not present".to_string());
     }
 
-    let text = String::from_utf8_lossy(&output.stdout);
+    CallProbe::Apps(parse_windows_consent_store(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Pull the meeting apps currently holding the microphone out of `reg query /s`
+/// output. Kept free of `cfg` so it builds and tests on every platform.
+#[allow(dead_code)] // Reached via probe_windows on Windows, and by tests everywhere
+fn parse_windows_consent_store(text: &str) -> Vec<String> {
     let mut apps = Vec::new();
     let mut current_key = String::new();
 
@@ -429,7 +481,7 @@ fn probe_windows() -> CallProbe {
         }
 
         // "LastUsedTimeStop    REG_QWORD    0x0" - zero means "still in use".
-        let value = trimmed.rsplit_whitespace().next().unwrap_or_default();
+        let value = trimmed.split_whitespace().last().unwrap_or_default();
         let in_use = value
             .strip_prefix("0x")
             .and_then(|hex| u64::from_str_radix(hex, 16).ok())
@@ -445,7 +497,7 @@ fn probe_windows() -> CallProbe {
         }
     }
 
-    CallProbe::Apps(apps)
+    apps
 }
 
 /// Linux: PulseAudio / PipeWire expose one "source output" per app recording audio.
@@ -465,7 +517,15 @@ fn probe_linux() -> CallProbe {
         return CallProbe::Unsupported("pactl could not list source outputs".to_string());
     }
 
-    let text = String::from_utf8_lossy(&output.stdout);
+    CallProbe::Apps(parse_pactl_source_outputs(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Pull the meeting apps currently capturing out of `pactl list source-outputs`
+/// output. Kept free of `cfg` so it builds and tests on every platform.
+#[allow(dead_code)] // Reached via probe_linux on Linux, and by tests everywhere
+fn parse_pactl_source_outputs(text: &str) -> Vec<String> {
     let mut apps = Vec::new();
     let mut corked = false;
     let mut identifiers: Vec<String> = Vec::new();
@@ -508,7 +568,7 @@ fn probe_linux() -> CallProbe {
 
     flush(corked, &mut identifiers, &mut apps);
 
-    CallProbe::Apps(apps)
+    apps
 }
 
 // ============================================================================
@@ -544,6 +604,264 @@ pub async fn get_call_detection_support() -> Result<CallDetectionSupport, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // Arm-then-stop timing
+    // ------------------------------------------------------------------
+
+    /// Drive the state machine on a synthetic clock.
+    struct Clock {
+        now: Instant,
+    }
+
+    impl Clock {
+        fn new() -> Self {
+            Self { now: Instant::now() }
+        }
+
+        fn advance(&mut self, secs: u64) -> Instant {
+            self.now += Duration::from_secs(secs);
+            self.now
+        }
+    }
+
+    #[test]
+    fn never_stops_a_recording_that_never_saw_a_call() {
+        // An in-person meeting: no meeting app ever holds the mic
+        let mut state = WatchState::default();
+        let mut clock = Clock::new();
+
+        for _ in 0..200 {
+            let now = clock.advance(3);
+            assert_eq!(state.observe(now, false), WatchAction::Wait);
+        }
+    }
+
+    #[test]
+    fn arms_only_after_the_call_has_been_up_long_enough() {
+        let mut state = WatchState::default();
+        let mut clock = Clock::new();
+
+        // First sighting starts the timer, it does not arm on its own
+        assert_eq!(state.observe(clock.now, true), WatchAction::Wait);
+        assert_eq!(state.observe(clock.advance(3), true), WatchAction::Wait);
+        // Crossing ARM_AFTER (5s) arms exactly once
+        assert_eq!(state.observe(clock.advance(3), true), WatchAction::Arm);
+        assert_eq!(state.observe(clock.advance(3), true), WatchAction::Wait);
+    }
+
+    #[test]
+    fn stops_once_the_call_has_been_gone_for_the_grace_period() {
+        let mut state = WatchState::default();
+        let mut clock = Clock::new();
+
+        state.observe(clock.now, true); // t=0
+        assert_eq!(state.observe(clock.advance(6), true), WatchAction::Arm); // t=6
+
+        // Inside END_GRACE (20s) nothing happens yet
+        assert_eq!(state.observe(clock.advance(3), false), WatchAction::Wait); // t=9, gone 0s
+        assert_eq!(state.observe(clock.advance(15), false), WatchAction::Wait); // t=24, gone 15s
+        // Crossing it stops
+        assert_eq!(state.observe(clock.advance(6), false), WatchAction::Stop); // t=30, gone 21s
+    }
+
+    #[test]
+    fn the_grace_period_boundary_is_exactly_end_grace() {
+        let mut state = WatchState::default();
+        let base = Instant::now();
+
+        state.observe(base, true);
+        assert_eq!(state.observe(base + ARM_AFTER, true), WatchAction::Arm);
+
+        // The call ends here, which is when the countdown starts
+        let ended = base + ARM_AFTER;
+        assert_eq!(state.observe(ended, false), WatchAction::Wait);
+        assert_eq!(
+            state.observe(ended + END_GRACE - Duration::from_millis(1), false),
+            WatchAction::Wait,
+            "must not stop a millisecond early"
+        );
+        assert_eq!(
+            state.observe(ended + END_GRACE, false),
+            WatchAction::Stop,
+            "must stop the moment the grace period is up"
+        );
+    }
+
+    #[test]
+    fn a_call_returning_mid_grace_cancels_the_stop() {
+        // The dropout a call switching audio devices produces
+        let mut state = WatchState::default();
+        let mut clock = Clock::new();
+
+        state.observe(clock.now, true); // t=0
+        assert_eq!(state.observe(clock.advance(6), true), WatchAction::Arm); // t=6
+
+        assert_eq!(state.observe(clock.advance(3), false), WatchAction::Wait); // t=9, gone 0s
+        assert_eq!(state.observe(clock.advance(9), false), WatchAction::Wait); // t=18, gone 9s
+        // Call comes back, well inside the grace period
+        assert_eq!(state.observe(clock.advance(3), true), WatchAction::Wait); // t=21
+
+        // The countdown restarts from here rather than resuming where it left off
+        assert_eq!(state.observe(clock.advance(15), false), WatchAction::Wait); // t=36, gone 0s
+        assert_eq!(state.observe(clock.advance(21), false), WatchAction::Stop); // t=57, gone 21s
+    }
+
+    #[test]
+    fn stays_armed_across_a_brief_dropout() {
+        let mut state = WatchState::default();
+        let mut clock = Clock::new();
+
+        state.observe(clock.now, true);
+        assert_eq!(state.observe(clock.advance(6), true), WatchAction::Arm);
+
+        // Blip out and straight back; must not re-arm (it never disarmed)
+        assert_eq!(state.observe(clock.advance(3), false), WatchAction::Wait);
+        assert_eq!(state.observe(clock.advance(3), true), WatchAction::Wait);
+    }
+
+    #[test]
+    fn reset_disarms_so_a_disabled_setting_cannot_stop_anything() {
+        let mut state = WatchState::default();
+        let mut clock = Clock::new();
+
+        state.observe(clock.now, true);
+        assert_eq!(state.observe(clock.advance(6), true), WatchAction::Arm);
+
+        // User switches auto-stop off mid-recording
+        state.reset();
+
+        // Even a long absence must not stop the recording now
+        assert_eq!(state.observe(clock.advance(60), false), WatchAction::Wait);
+        assert_eq!(state.observe(clock.advance(60), false), WatchAction::Wait);
+    }
+
+    // ------------------------------------------------------------------
+    // Windows: microphone consent store
+    // ------------------------------------------------------------------
+
+    /// Shape of `reg query ...\ConsentStore\microphone /s` output.
+    const WINDOWS_CONSENT_STORE: &str = r#"
+HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone
+    Value    REG_SZ    Allow
+
+HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\MSTeams_8wekyb3d8bbwe
+    Value    REG_SZ    Allow
+    LastUsedTimeStart    REG_QWORD    0x1db4f2e8a1b2c3d
+    LastUsedTimeStop    REG_QWORD    0x0
+
+HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\NonPackaged
+
+HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\NonPackaged\C:#Program Files#Zoom#bin#Zoom.exe
+    Value    REG_SZ    Allow
+    LastUsedTimeStart    REG_QWORD    0x1db4f2e8a1b2c3d
+    LastUsedTimeStop    REG_QWORD    0x0
+
+HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\NonPackaged\C:#Program Files#Slack#slack.exe
+    Value    REG_SZ    Allow
+    LastUsedTimeStart    REG_QWORD    0x1db4f2e8a1b2c3d
+    LastUsedTimeStop    REG_QWORD    0x1db4f2ea9c8d7e6
+
+HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\NonPackaged\C:#Windows#System32#VoiceRecorder.exe
+    Value    REG_SZ    Allow
+    LastUsedTimeStart    REG_QWORD    0x1db4f2e8a1b2c3d
+    LastUsedTimeStop    REG_QWORD    0x0
+"#;
+
+    #[test]
+    fn windows_reports_only_apps_still_holding_the_microphone() {
+        let apps = parse_windows_consent_store(WINDOWS_CONSENT_STORE);
+
+        // Teams (packaged) and Zoom (non-packaged) both report LastUsedTimeStop = 0
+        assert!(apps.contains(&"Microsoft Teams".to_string()), "got {:?}", apps);
+        assert!(apps.contains(&"Zoom".to_string()), "got {:?}", apps);
+        // Slack has a real stop time, so it finished with the mic
+        assert!(!apps.contains(&"Slack".to_string()), "got {:?}", apps);
+        // Voice Recorder is holding the mic but is not a meeting app
+        assert_eq!(apps.len(), 2, "got {:?}", apps);
+    }
+
+    #[test]
+    fn windows_reports_nothing_when_no_app_holds_the_microphone() {
+        let idle = WINDOWS_CONSENT_STORE.replace("0x0", "0x1db4f2ea9c8d7e6");
+        assert!(parse_windows_consent_store(&idle).is_empty());
+    }
+
+    #[test]
+    fn windows_survives_empty_and_malformed_output() {
+        assert!(parse_windows_consent_store("").is_empty());
+        assert!(parse_windows_consent_store("ERROR: The system was unable to find").is_empty());
+        // A value with no owning key must not be attributed to anything
+        assert!(parse_windows_consent_store("    LastUsedTimeStop    REG_QWORD    0x0").is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Linux: PulseAudio / PipeWire source outputs
+    // ------------------------------------------------------------------
+
+    /// Shape of `pactl list source-outputs` output.
+    const PACTL_SOURCE_OUTPUTS: &str = r#"
+Source Output #12
+	Driver: protocol-native.c
+	Owner Module: 8
+	Client: 31
+	Source: 1
+	Sample Specification: s16le 1ch 48000Hz
+	Corked: no
+	Mute: no
+	Properties:
+		application.name = "ZOOM VoiceEngine"
+		application.process.binary = "zoom"
+		application.process.id = "4242"
+
+Source Output #13
+	Driver: protocol-native.c
+	Client: 44
+	Corked: yes
+	Properties:
+		application.name = "Firefox"
+		application.process.binary = "firefox"
+
+Source Output #14
+	Driver: protocol-native.c
+	Client: 51
+	Corked: no
+	Properties:
+		application.name = "PulseAudio Volume Control"
+		application.process.binary = "pavucontrol"
+"#;
+
+    #[test]
+    fn linux_reports_uncorked_meeting_apps_only() {
+        let apps = parse_pactl_source_outputs(PACTL_SOURCE_OUTPUTS);
+
+        assert!(apps.contains(&"Zoom".to_string()), "got {:?}", apps);
+        // Firefox has the mic open but corked - not actually capturing
+        assert!(!apps.contains(&"Firefox".to_string()), "got {:?}", apps);
+        // pavucontrol is capturing but is not a meeting app
+        assert_eq!(apps, vec!["Zoom".to_string()], "got {:?}", apps);
+    }
+
+    #[test]
+    fn linux_picks_up_the_last_block_without_a_trailing_separator() {
+        // The final block has no "Source Output #" after it to flush it
+        let single = r#"Source Output #1
+	Corked: no
+	Properties:
+		application.process.binary = "teams-for-linux"
+"#;
+        assert_eq!(parse_pactl_source_outputs(single), vec!["Microsoft Teams".to_string()]);
+    }
+
+    #[test]
+    fn linux_survives_empty_output() {
+        assert!(parse_pactl_source_outputs("").is_empty());
+        assert!(parse_pactl_source_outputs("Failure: No such entity").is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // App matching
+    // ------------------------------------------------------------------
 
     #[test]
     fn matches_known_meeting_apps() {

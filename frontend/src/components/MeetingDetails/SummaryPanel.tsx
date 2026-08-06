@@ -7,6 +7,7 @@ import { EmptyStateSummary } from '@/components/EmptyStateSummary';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { SummaryGeneratorButtonGroup } from './SummaryGeneratorButtonGroup';
 import { SummaryUpdaterButtonGroup } from './SummaryUpdaterButtonGroup';
+import { ResumeRecordingButton } from './ResumeRecordingButton';
 import Analytics from '@/lib/analytics';
 import { useEffect, useRef, useState, RefObject } from 'react';
 import { toast } from 'sonner';
@@ -311,6 +312,13 @@ export function SummaryPanel({
           </button>
         )}
         <div className="flex-1" />
+
+        {/* Always available - a meeting can be recorded into again whether or not
+            it has a summary yet */}
+        <ResumeRecordingButton
+          meetingId={meeting?.id}
+          meetingTitle={meetingTitle || meeting?.title || 'Meeting'}
+        />
 
         {/* Button groups - only show when summary exists */}
         {aiSummary && !isSummaryLoading && (

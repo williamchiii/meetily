@@ -36,6 +36,7 @@ pub mod system_audio_commands;
 pub mod device_monitor;  // NEW: Device disconnect/reconnect monitoring
 pub mod playback_monitor; // NEW: Playback device detection for BT warnings
 pub mod call_detector;   // NEW: Auto-stop recording when the call ends
+pub mod recording_merge; // NEW: Fold a resumed recording's files into the meeting it continues
 
 // Transcription module (provider abstraction, engine management, worker pool)
 pub mod transcription;

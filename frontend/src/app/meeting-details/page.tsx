@@ -23,6 +23,9 @@ function MeetingDetailsContent() {
   const searchParams = useSearchParams();
   const meetingId = searchParams.get('id');
   const source = searchParams.get('source'); // Check if navigated from recording
+  // A resumed recording just appended to this meeting, so any existing summary
+  // only covers the first half of it
+  const isMerged = searchParams.get('merged') === 'true';
   const { setCurrentMeeting, refetchMeetings, stopSummaryPolling } = useSidebar();
   const { isAutoSummary } = useConfig(); // Get auto-summary toggle state
   const router = useRouter();
@@ -317,23 +320,28 @@ function MeetingDetailsContent() {
     const checkAutoGen = async () => {
       // Only auto-generate if:
       // 1. We have meeting details
-      // 2. No summary exists
+      // 2. No summary exists - unless a resume just merged new transcripts in,
+      //    which makes the existing summary incomplete
       // 3. Meeting has transcripts
       // 4. Haven't checked yet
       if (
         meetingDetails &&
-        meetingSummary === null &&
+        (meetingSummary === null || isMerged) &&
         meetingDetails.transcripts &&
         meetingDetails.transcripts.length > 0 &&
         !hasCheckedAutoGen
       ) {
-        console.log('No summary found, checking for auto-generation...');
+        console.log(
+          isMerged
+            ? 'Meeting was extended by a resumed recording, checking for auto-regeneration...'
+            : 'No summary found, checking for auto-generation...'
+        );
         await setupAutoGeneration();
       }
     };
 
     checkAutoGen();
-  }, [meetingDetails, meetingSummary, hasCheckedAutoGen, setupAutoGeneration]);
+  }, [meetingDetails, meetingSummary, hasCheckedAutoGen, setupAutoGeneration, isMerged]);
 
   if (error) {
     return (
@@ -362,6 +370,7 @@ function MeetingDetailsContent() {
     meeting={meetingDetails}
     summaryData={meetingSummary}
     shouldAutoGenerate={shouldAutoGenerate}
+    autoGenerateIsRegeneration={isMerged && meetingSummary !== null}
     onAutoGenerateComplete={() => setShouldAutoGenerate(false)}
     onMeetingUpdated={async () => {
       // Refetch meeting details to get updated title from backend
