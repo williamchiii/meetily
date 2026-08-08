@@ -9,6 +9,7 @@ import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
 import { useResumeRecording } from '@/hooks/useResumeRecording';
 import { takeActiveResumeMeetingId } from '@/lib/resume-intent';
+import { useScreenshots } from '@/contexts/ScreenshotContext';
 import Analytics from '@/lib/analytics';
 import {
   applyPinnedSummaryLanguageToMeeting,
@@ -71,6 +72,7 @@ export function useRecordingStop(
 
   const router = useRouter();
   const resumeRecording = useResumeRecording();
+  const { attachToMeeting: attachScreenshots } = useScreenshots();
 
   // Guard to prevent duplicate/concurrent stop calls (e.g., from UI and tray simultaneously)
   const stopInProgressRef = useRef(false);
@@ -344,6 +346,21 @@ export function useRecordingStop(
             throw new Error('No meeting ID received from save operation');
           }
 
+          // Screenshots shared during the recording belong to this meeting now.
+          // Best-effort: the transcript is already saved, and losing screen context
+          // must not fail the stop.
+          try {
+            const attached = await attachScreenshots(meetingId);
+            if (attached > 0) {
+              console.log(`🖼️ Attached ${attached} screenshot(s) to meeting ${meetingId}`);
+            }
+          } catch (screenshotError) {
+            console.error('Failed to attach screenshots:', screenshotError);
+            toast.warning('Could not save the screenshot context', {
+              description: 'The meeting was saved, but the screen context was not attached.',
+            });
+          }
+
           // Fold the resumed recording's audio into the meeting's own folder, so
           // playback and retranscription cover the whole conversation. Best-effort:
           // the transcripts are already saved, and a failed merge must not fail the
@@ -579,6 +596,7 @@ export function useRecordingStop(
     setIsMeetingActive,
     router,
     resumeFromToast,
+    attachScreenshots,
   ]);
 
   // Expose handleRecordingStop function to window for Rust callbacks

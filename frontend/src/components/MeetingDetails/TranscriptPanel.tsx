@@ -4,6 +4,7 @@ import { Transcript, TranscriptSegmentData } from '@/types';
 import { TranscriptView } from '@/components/TranscriptView';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { TranscriptButtonGroup } from './TranscriptButtonGroup';
+import { ScreenshotContextSection } from './ScreenshotContextSection';
 import { useMemo } from 'react';
 
 interface TranscriptPanelProps {
@@ -77,6 +78,9 @@ export function TranscriptPanel({
           onRefetchTranscripts={onRefetchTranscripts}
         />
       </div>
+
+      {/* What the AI read off shared screenshots, ahead of the first spoken words */}
+      <ScreenshotContextSection meetingId={meetingId} />
 
       {/* Transcript content - use virtualized view for better performance */}
       <div className="flex-1 overflow-hidden pb-4">

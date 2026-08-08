@@ -21,6 +21,7 @@ import { loadBetaFeatures } from '@/types/betaFeatures'
 import { DownloadProgressToastProvider } from '@/components/shared/DownloadProgressToast'
 import { UpdateCheckProvider } from '@/components/UpdateCheckProvider'
 import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcessingProvider'
+import { ScreenshotProvider } from '@/contexts/ScreenshotContext'
 import { ImportAudioDialog, ImportDropOverlay } from '@/components/ImportAudio'
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
@@ -235,6 +236,7 @@ export default function RootLayout({
                     <UpdateCheckProvider>
                       <SidebarProvider>
                         <TooltipProvider>
+                          <ScreenshotProvider>
                           <RecordingPostProcessingProvider>
                             <ImportDialogProvider onOpen={handleOpenImportDialog}>
                               {/* Download progress toast provider - listens for background downloads */}
@@ -263,6 +265,7 @@ export default function RootLayout({
                               />
                             </ImportDialogProvider>
                           </RecordingPostProcessingProvider>
+                          </ScreenshotProvider>
                         </TooltipProvider>
                       </SidebarProvider>
                     </UpdateCheckProvider>

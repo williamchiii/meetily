@@ -1,5 +1,6 @@
 use crate::database::repositories::{
-    meeting::MeetingsRepository, setting::SettingsRepository, summary::SummaryProcessesRepository,
+    meeting::MeetingsRepository, screenshot::ScreenshotsRepository, setting::SettingsRepository,
+    summary::SummaryProcessesRepository,
 };
 use crate::summary::llm_client::LLMProvider;
 use crate::summary::language_detection::detect_summary_language;
@@ -307,6 +308,33 @@ impl SummaryService {
             "Starting background processing for meeting_id: {}",
             meeting_id
         );
+
+        // Screenshots shared during the meeting carry information nobody said out
+        // loud, so their extracted text joins the user's own context. Merging it into
+        // custom_prompt here also means it feeds the cache fingerprint below, so
+        // adding a screenshot correctly invalidates a stale cached summary.
+        let custom_prompt = match ScreenshotsRepository::context_block(&pool, &meeting_id).await {
+            Ok(Some(block)) => {
+                info!(
+                    "Including {} chars of shared-screen context for meeting_id: {}",
+                    block.len(),
+                    meeting_id
+                );
+                if custom_prompt.trim().is_empty() {
+                    block
+                } else {
+                    format!("{}\n\n{}", custom_prompt, block)
+                }
+            }
+            Ok(None) => custom_prompt,
+            Err(e) => {
+                warn!(
+                    "Could not load shared-screen context for meeting_id={}: {}. Summarising without it.",
+                    meeting_id, e
+                );
+                custom_prompt
+            }
+        };
 
         // Register cancellation token for this meeting
         let cancellation_token = Self::register_cancellation_token(&meeting_id);
