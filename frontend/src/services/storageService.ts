@@ -24,6 +24,14 @@ export interface Meeting {
   [key: string]: any; // Allow additional properties from backend
 }
 
+export interface MergeRecordingResponse {
+  merged: boolean;
+  detail: string;
+  duration_seconds?: number | null;
+  /** Where the merged-from folder was moved, when it could be retired. */
+  retired_to?: string | null;
+}
+
 /**
  * Storage Service
  * Singleton service for managing meeting storage operations
@@ -45,6 +53,39 @@ export class StorageService {
       meetingTitle,
       transcripts,
       folderPath,
+    });
+  }
+
+  /**
+   * Append transcript segments to a meeting that already exists.
+   * Used when a recording is resumed after it stopped, so both stretches of the
+   * conversation end up in one meeting instead of two.
+   * @param meetingId - ID of the meeting to append to
+   * @param transcripts - Transcript segments from the resumed recording
+   */
+  async appendToMeeting(
+    meetingId: string,
+    transcripts: Transcript[]
+  ): Promise<SaveMeetingResponse> {
+    return invoke<SaveMeetingResponse>('api_append_transcript', {
+      meetingId,
+      transcripts,
+    });
+  }
+
+  /**
+   * Fold a resumed recording's audio and sidecar files into the meeting it continues,
+   * so the meeting folder holds the whole conversation rather than just its first half.
+   * @param meetingId - Meeting that was appended to
+   * @param resumedFolderPath - Folder the resumed recording saved into
+   */
+  async mergeResumedRecording(
+    meetingId: string,
+    resumedFolderPath: string
+  ): Promise<MergeRecordingResponse> {
+    return invoke<MergeRecordingResponse>('api_merge_resumed_recording', {
+      meetingId,
+      resumedFolderPath,
     });
   }
 

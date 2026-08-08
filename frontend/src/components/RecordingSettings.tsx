@@ -12,6 +12,12 @@ export interface RecordingPreferences {
   file_format: string;
   preferred_mic_device: string | null;
   preferred_system_device: string | null;
+  auto_stop_on_call_end: boolean;
+}
+
+interface CallDetectionSupport {
+  supported: boolean;
+  reason: string | null;
 }
 
 interface RecordingSettingsProps {
@@ -24,11 +30,13 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     auto_save: true,
     file_format: 'mp4',
     preferred_mic_device: null,
-    preferred_system_device: null
+    preferred_system_device: null,
+    auto_stop_on_call_end: true
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [showRecordingNotification, setShowRecordingNotification] = useState(true);
+  const [callDetection, setCallDetection] = useState<CallDetectionSupport | null>(null);
 
   // Load recording preferences on component mount
   useEffect(() => {
@@ -68,6 +76,19 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     loadNotificationPref();
   }, []);
 
+  // Find out whether this machine can detect calls at all, so the toggle can say
+  // when it would have no effect
+  useEffect(() => {
+    const loadCallDetectionSupport = async () => {
+      try {
+        setCallDetection(await invoke<CallDetectionSupport>('get_call_detection_support'));
+      } catch (error) {
+        console.error('Failed to check call detection support:', error);
+      }
+    };
+    loadCallDetectionSupport();
+  }, []);
+
   const handleAutoSaveToggle = async (enabled: boolean) => {
     const newPreferences = { ...preferences, auto_save: enabled };
     setPreferences(newPreferences);
@@ -75,6 +96,21 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
 
     // Track auto-save setting change
     await Analytics.track('auto_save_recording_toggled', {
+      enabled: enabled.toString()
+    });
+  };
+
+  const handleAutoStopToggle = async (enabled: boolean) => {
+    const newPreferences = { ...preferences, auto_stop_on_call_end: enabled };
+    setPreferences(newPreferences);
+    await savePreferences(newPreferences, {
+      title: 'Preference saved',
+      description: enabled
+        ? 'Recording will stop automatically when a call ends'
+        : 'Recording will keep going after a call ends'
+    });
+
+    await Analytics.track('auto_stop_on_call_end_toggled', {
       enabled: enabled.toString()
     });
   };
@@ -121,7 +157,10 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     }
   };
 
-  const savePreferences = async (prefs: RecordingPreferences) => {
+  const savePreferences = async (
+    prefs: RecordingPreferences,
+    successToast?: { title: string; description: string }
+  ) => {
     setSaving(true);
     try {
       await invoke('set_recording_preferences', { preferences: prefs });
@@ -130,8 +169,9 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
       // Show success toast with device details
       const micDevice = prefs.preferred_mic_device || 'Default';
       const systemDevice = prefs.preferred_system_device || 'Default';
-      toast.success("Device preferences saved", {
-        description: `Microphone: ${micDevice}, System Audio: ${systemDevice}`
+      toast.success(successToast?.title ?? "Device preferences saved", {
+        description: successToast?.description
+          ?? `Microphone: ${micDevice}, System Audio: ${systemDevice}`
       });
     } catch (error) {
       console.error('Failed to save recording preferences:', error);
@@ -212,6 +252,29 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
           </div>
         </div>
       )}
+
+      {/* Auto Stop When Call Ends Toggle */}
+      <div className="p-4 border rounded-lg">
+        <div className="flex items-center justify-between">
+          <div className="flex-1">
+            <div className="font-medium">Stop Recording When Call Ends</div>
+            <div className="text-sm text-gray-600">
+              Automatically end the recording once you leave the call, just like pressing stop
+            </div>
+          </div>
+          <Switch
+            checked={preferences.auto_stop_on_call_end}
+            onCheckedChange={handleAutoStopToggle}
+            disabled={saving || callDetection?.supported === false}
+          />
+        </div>
+        {callDetection?.supported === false && (
+          <div className="mt-3 text-xs text-yellow-800 bg-yellow-50 border border-yellow-200 rounded-md p-2">
+            Call detection is unavailable on this system, so recordings will not stop on their own.
+            {callDetection.reason ? ` (${callDetection.reason})` : ''}
+          </div>
+        )}
+      </div>
 
       {/* Recording Notification Toggle */}
       <div className="flex items-center justify-between p-4 border rounded-lg">

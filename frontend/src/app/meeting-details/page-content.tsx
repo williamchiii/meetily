@@ -22,6 +22,7 @@ export default function PageContent({
   meeting,
   summaryData,
   shouldAutoGenerate = false,
+  autoGenerateIsRegeneration = false,
   onAutoGenerateComplete,
   onMeetingUpdated,
   onRefetchTranscripts,
@@ -36,6 +37,8 @@ export default function PageContent({
   meeting: any;
   summaryData: Summary | null;
   shouldAutoGenerate?: boolean;
+  /** Replace an existing summary rather than writing the first one. */
+  autoGenerateIsRegeneration?: boolean;
   onAutoGenerateComplete?: () => void;
   onMeetingUpdated?: () => Promise<void>;
   onRefetchTranscripts?: () => Promise<void>;
@@ -148,7 +151,15 @@ export default function PageContent({
     const autoGenerate = async () => {
       if (shouldAutoGenerate && meetingData.transcripts.length > 0 && !cancelled) {
         console.log(`🤖 Auto-generating summary with ${modelConfig.provider}/${modelConfig.model}...`);
-        await summaryGeneration.handleGenerateSummary('');
+
+        if (autoGenerateIsRegeneration) {
+          // A resume merged more transcripts in; replace the summary that covered
+          // only the first stretch
+          toast.info('Meeting extended - regenerating summary');
+          await summaryGeneration.handleRegenerateSummary();
+        } else {
+          await summaryGeneration.handleGenerateSummary('');
+        }
 
         // Notify parent that auto-generation is complete (only if not cancelled)
         if (onAutoGenerateComplete && !cancelled) {
@@ -163,7 +174,7 @@ export default function PageContent({
     return () => {
       cancelled = true;
     };
-  }, [shouldAutoGenerate, meeting.id]); // Re-run if meeting changes
+  }, [shouldAutoGenerate, autoGenerateIsRegeneration, meeting.id]); // Re-run if meeting changes
 
   return (
     <motion.div

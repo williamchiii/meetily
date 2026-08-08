@@ -1120,6 +1120,114 @@ pub async fn api_save_transcript<R: Runtime>(
     }
 }
 
+/// Appends transcripts to an existing meeting, used when a recording is resumed
+/// after it stopped so both halves land in one meeting.
+#[tauri::command]
+pub async fn api_append_transcript<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+    transcripts: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    log_info!(
+        "api_append_transcript called for meeting: {}, transcripts: {}",
+        meeting_id,
+        transcripts.len()
+    );
+
+    let transcripts_to_save: Vec<TranscriptSegment> = transcripts
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            log_error!("Failed to parse transcript segments: {}", e);
+            format!("Invalid transcript data format: {}. Please check the data structure.", e)
+        })?;
+
+    let pool = state.db_manager.pool();
+
+    match TranscriptsRepository::append_transcript(pool, &meeting_id, &transcripts_to_save).await {
+        Ok(_) => {
+            log_info!("Successfully appended transcripts to meeting {}", meeting_id);
+            Ok(serde_json::json!({
+                "status": "success",
+                "message": "Transcript appended successfully",
+                "meeting_id": meeting_id
+            }))
+        }
+        Err(e) => {
+            log_error!(
+                "Error appending transcript to meeting '{}': {}",
+                meeting_id,
+                e
+            );
+            Err(format!("Failed to append transcript: {}", e))
+        }
+    }
+}
+
+/// Folds a resumed recording's audio and sidecar files into the meeting it continues,
+/// so the meeting's folder holds the whole conversation rather than just its first half.
+#[tauri::command]
+pub async fn api_merge_resumed_recording<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+    resumed_folder_path: String,
+) -> Result<serde_json::Value, String> {
+    log_info!(
+        "api_merge_resumed_recording called for meeting {} from {}",
+        meeting_id,
+        resumed_folder_path
+    );
+
+    let pool = state.db_manager.pool();
+
+    let meeting: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT folder_path FROM meetings WHERE id = ?")
+            .bind(&meeting_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("Database error: {}", e))?;
+
+    let Some((Some(meeting_folder),)) = meeting else {
+        log_info!("Meeting {} has no folder on disk, nothing to merge", meeting_id);
+        return Ok(serde_json::json!({
+            "merged": false,
+            "detail": "Meeting has no recording folder to merge into",
+        }));
+    };
+
+    // Retirement is bounded by the folder the user actually records into, which the
+    // Settings UI can move away from the per-platform default
+    let recordings_root =
+        match crate::audio::recording_preferences::load_recording_preferences(&app).await {
+            Ok(prefs) => prefs.save_folder,
+            Err(e) => {
+                log_error!("Could not load recording preferences: {}", e);
+                crate::audio::recording_preferences::get_default_recordings_folder()
+            }
+        };
+
+    let report = tokio::task::spawn_blocking(move || {
+        crate::audio::recording_merge::merge_recording_folders(
+            std::path::Path::new(&meeting_folder),
+            std::path::Path::new(&resumed_folder_path),
+            &recordings_root,
+        )
+    })
+    .await
+    .map_err(|e| format!("Merge task failed: {}", e))?
+    .map_err(|e| {
+        log_error!("Failed to merge resumed recording into {}: {}", meeting_id, e);
+        format!("Failed to merge recordings: {}", e)
+    })?;
+
+    log_info!("Merge result for {}: {}", meeting_id, report.detail);
+
+    serde_json::to_value(report).map_err(|e| format!("Failed to serialize merge report: {}", e))
+}
+
 /// Opens the meeting's recording folder in the system file explorer
 #[tauri::command]
 pub async fn open_meeting_folder<R: Runtime>(

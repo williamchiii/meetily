@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import { RecordingControls } from '@/components/RecordingControls';
+import { ScreenshotContextPanel } from '@/components/ScreenshotContextPanel';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { usePermissionCheck } from '@/hooks/usePermissionCheck';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
@@ -230,7 +231,7 @@ export default function Home() {
                   marginLeft: sidebarCollapsed ? 0 : sidebarWidth
                 }}
               >
-                <div className="w-2/3 max-w-[750px] flex justify-center">
+                <div className="w-2/3 max-w-[750px] flex flex-col items-center">
                   <div className="bg-surface rounded-full shadow-lg flex items-center">
                     <RecordingControls
                       isRecording={recordingState.isRecording}
@@ -248,6 +249,10 @@ export default function Home() {
                       meetingName={meetingTitle}
                     />
                   </div>
+
+                  {/* Screenshots shared during the call, read by the AI so the
+                      summary knows what was on screen */}
+                  <ScreenshotContextPanel isRecording={recordingState.isRecording} />
                 </div>
               </div>
             </div>

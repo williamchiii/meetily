@@ -7,6 +7,9 @@ import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
+import { useResumeRecording } from '@/hooks/useResumeRecording';
+import { takeActiveResumeMeetingId } from '@/lib/resume-intent';
+import { useScreenshots } from '@/contexts/ScreenshotContext';
 import Analytics from '@/lib/analytics';
 import {
   applyPinnedSummaryLanguageToMeeting,
@@ -68,9 +71,52 @@ export function useRecordingStop(
   } = useSidebar();
 
   const router = useRouter();
+  const resumeRecording = useResumeRecording();
+  const { attachToMeeting: attachScreenshots } = useScreenshots();
 
   // Guard to prevent duplicate/concurrent stop calls (e.g., from UI and tray simultaneously)
   const stopInProgressRef = useRef(false);
+
+  // Whether this stop was the call detector's doing rather than the user's
+  const autoStoppedRef = useRef(false);
+
+  // Set when the user resumes from the auto-stop toast, so the post-stop
+  // navigation does not drag them off the recording page they just returned to
+  const resumeRequestedRef = useRef(false);
+
+  // Track unattended stops so they can offer a way back into the same meeting
+  useEffect(() => {
+    let unlistenAutoStop: (() => void) | undefined;
+    let unlistenStarted: (() => void) | undefined;
+
+    const setupListeners = async () => {
+      try {
+        unlistenAutoStop = await listen('recording-auto-stopped', () => {
+          autoStoppedRef.current = true;
+        });
+        // A fresh recording is never the tail of an earlier auto-stop
+        unlistenStarted = await listen('recording-started', () => {
+          autoStoppedRef.current = false;
+        });
+      } catch (error) {
+        console.error('Failed to setup auto-stop listeners:', error);
+      }
+    };
+
+    setupListeners();
+
+    return () => {
+      unlistenAutoStop?.();
+      unlistenStarted?.();
+    };
+  }, []);
+
+  /** Resume from the auto-stop toast, continuing the meeting that just saved. */
+  const resumeFromToast = useCallback((meetingId: string, title: string) => {
+    // Suppress the post-stop navigation below; resuming already moved the user
+    resumeRequestedRef.current = true;
+    resumeRecording(meetingId, title, 'auto_stop_toast');
+  }, [resumeRecording]);
 
   // Promise to track recording-stopped event data (fixes race condition with recording-stop-complete)
   const recordingStoppedDataRef = useRef<Promise<void> | null>(null);
@@ -128,6 +174,7 @@ export function useRecordingStop(
       return;
     }
     stopInProgressRef.current = true;
+    resumeRequestedRef.current = false;
 
     // Set status to STOPPING immediately
     setStatus(RecordingStatus.STOPPING);
@@ -230,6 +277,14 @@ export function useRecordingStop(
       console.log('Waiting for transcript state updates to complete...');
       await new Promise(resolve => setTimeout(resolve, 500));
 
+      // A resumed recording continues a meeting that is already in the database, so
+      // its segments are appended instead of creating a second meeting.
+      //
+      // Consumed OUTSIDE the save guard below: this recording is over either way, and
+      // leaving the intent behind on a failed stop would silently append the user's
+      // NEXT, unrelated recording to this meeting.
+      const resumingMeetingId = takeActiveResumeMeetingId(sessionStorage);
+
       // Save to SQLite
       // NOTE: enabled to save COMPLETE transcripts after frontend receives all updates
       // This ensures user sees all transcripts streaming in before database save
@@ -248,16 +303,42 @@ export function useRecordingStop(
           transcript_count: freshTranscripts.length,
           meeting_name: savedMeetingName || meetingTitle,
           folder_path: folderPath,
+          appending_to: resumingMeetingId ?? 'new meeting',
           sample_text: freshTranscripts.length > 0 ? freshTranscripts[0].text.substring(0, 50) + '...' : 'none',
           last_transcript: freshTranscripts.length > 0 ? freshTranscripts[freshTranscripts.length - 1].text.substring(0, 30) + '...' : 'none',
         });
 
+        const saveAsNewMeeting = () => storageService.saveMeeting(
+          savedMeetingName || meetingTitle || 'New Meeting',  // PREFER savedMeetingName (backend source)
+          freshTranscripts,
+          folderPath
+        );
+
         try {
-          const responseData = await storageService.saveMeeting(
-            savedMeetingName || meetingTitle || 'New Meeting',  // PREFER savedMeetingName (backend source)
-            freshTranscripts,
-            folderPath
-          );
+          let responseData;
+          let appendFellBack = false;
+
+          if (resumingMeetingId) {
+            try {
+              responseData = await storageService.appendToMeeting(resumingMeetingId, freshTranscripts);
+            } catch (appendError) {
+              // The meeting may have been deleted while this recording ran. Losing
+              // the transcripts is far worse than an extra meeting, so fall back to
+              // saving them on their own rather than letting the stop fail.
+              console.error('Append failed, saving as a new meeting instead:', appendError);
+              appendFellBack = true;
+              responseData = await saveAsNewMeeting();
+              toast.warning('Could not add to the original meeting', {
+                description: 'The recording was saved as a separate meeting instead.',
+              });
+            }
+          } else {
+            responseData = await saveAsNewMeeting();
+          }
+
+          // A fallback save produced a brand new meeting, so nothing is being merged
+          // into an existing one any more
+          const appendedToMeetingId = appendFellBack ? null : resumingMeetingId;
 
           const meetingId = responseData.meeting_id;
           if (!meetingId) {
@@ -265,27 +346,76 @@ export function useRecordingStop(
             throw new Error('No meeting ID received from save operation');
           }
 
-          let shouldDetectSummaryLanguage = false;
+          // Screenshots shared during the recording belong to this meeting now.
+          // Best-effort: the transcript is already saved, and losing screen context
+          // must not fail the stop.
           try {
-            shouldDetectSummaryLanguage = !(await applyPinnedSummaryLanguageToMeeting(meetingId));
-          } catch (error) {
-            console.warn('Failed to apply pinned summary language preference for new meeting:', error);
-            toast.warning('Could not apply default summary language', {
-              description: 'The meeting was saved, but the default summary language was not applied.',
+            const attached = await attachScreenshots(meetingId);
+            if (attached > 0) {
+              console.log(`🖼️ Attached ${attached} screenshot(s) to meeting ${meetingId}`);
+            }
+          } catch (screenshotError) {
+            console.error('Failed to attach screenshots:', screenshotError);
+            toast.warning('Could not save the screenshot context', {
+              description: 'The meeting was saved, but the screen context was not attached.',
             });
           }
 
-          if (shouldDetectSummaryLanguage) {
+          // Fold the resumed recording's audio into the meeting's own folder, so
+          // playback and retranscription cover the whole conversation. Best-effort:
+          // the transcripts are already saved, and a failed merge must not fail the
+          // stop or lose the recording that is still on disk.
+          if (appendedToMeetingId && folderPath) {
             try {
-              await detectAndCacheSummaryLanguage(
-                meetingId,
-                freshTranscripts.map(t => t.text)
+              const merge = await storageService.mergeResumedRecording(
+                appendedToMeetingId,
+                folderPath
               );
-            } catch (error) {
-              console.warn('Failed to detect summary language for new meeting:', error);
-              toast.warning('Could not detect summary language', {
-                description: 'The meeting was saved, but Auto could not detect the summary language.',
+
+              // Every "nothing to do" path resolves successfully with merged:false
+              // rather than throwing, so the flag is the only way to tell a real
+              // merge from a silent no-op
+              if (merge.merged) {
+                console.log('🎧 Merged recording folders:', merge.detail, merge.retired_to ?? '');
+              } else {
+                console.warn('🎧 Recording folders NOT merged:', merge.detail);
+                toast.warning('Recording folders were not merged', {
+                  description: merge.detail,
+                });
+              }
+            } catch (mergeError) {
+              console.error('Failed to merge resumed recording folders:', mergeError);
+              toast.warning('Could not merge the resumed recording', {
+                description: 'The transcript was saved. The resumed files are still in their own folder.',
               });
+            }
+          }
+
+          // The summary language was already settled when the meeting was first
+          // saved, so an append leaves it alone
+          if (!appendedToMeetingId) {
+            let shouldDetectSummaryLanguage = false;
+            try {
+              shouldDetectSummaryLanguage = !(await applyPinnedSummaryLanguageToMeeting(meetingId));
+            } catch (error) {
+              console.warn('Failed to apply pinned summary language preference for new meeting:', error);
+              toast.warning('Could not apply default summary language', {
+                description: 'The meeting was saved, but the default summary language was not applied.',
+              });
+            }
+
+            if (shouldDetectSummaryLanguage) {
+              try {
+                await detectAndCacheSummaryLanguage(
+                  meetingId,
+                  freshTranscripts.map(t => t.text)
+                );
+              } catch (error) {
+                console.warn('Failed to detect summary language for new meeting:', error);
+                toast.warning('Could not detect summary language', {
+                  description: 'The meeting was saved, but Auto could not detect the summary language.',
+                });
+              }
             }
           }
 
@@ -322,27 +452,57 @@ export function useRecordingStop(
           // Mark as completed
           setStatus(RecordingStatus.COMPLETED);
 
-          // Show success toast with navigation option
-          toast.success('Recording saved successfully!', {
-            description: `${freshTranscripts.length} transcript segments saved.`,
-            action: {
-              label: 'View Meeting',
-              onClick: () => {
-                router.push(`/meeting-details?id=${meetingId}`);
-                Analytics.trackButtonClick('view_meeting_from_toast', 'recording_complete');
-              }
-            },
-            duration: 10000,
-          });
+          const wasAutoStopped = autoStoppedRef.current;
+          autoStoppedRef.current = false;
+
+          if (wasAutoStopped) {
+            // The user never asked for this stop, so offer the way back: resuming
+            // continues this same meeting rather than starting a second one.
+            toast.success('Recording stopped - call ended', {
+              description: `${freshTranscripts.length} transcript segments saved. Still talking?`,
+              action: {
+                label: 'Resume recording',
+                onClick: () => resumeFromToast(
+                  meetingId,
+                  savedMeetingName || meetingTitle || 'New Meeting'
+                )
+              },
+              duration: 60000,
+            });
+          } else {
+            // Show success toast with navigation option
+            toast.success('Recording saved successfully!', {
+              description: `${freshTranscripts.length} transcript segments saved.`,
+              action: {
+                label: 'View Meeting',
+                onClick: () => {
+                  router.push(`/meeting-details?id=${meetingId}`);
+                  Analytics.trackButtonClick('view_meeting_from_toast', 'recording_complete');
+                }
+              },
+              duration: 10000,
+            });
+          }
 
           // Auto-navigate after a short delay with source parameter
           setTimeout(() => {
-            router.push(`/meeting-details?id=${meetingId}&source=recording`);
-            clearTranscripts()
-            Analytics.trackPageView('meeting_details');
-
-            // Reset to IDLE after navigation
+            // This meeting is finished either way, so release its transcripts and
+            // status before deciding where to send the user - skipping the cleanup
+            // on the resume path would leave the finished meeting's segments in the
+            // shared list and the status pinned at COMPLETED
+            clearTranscripts();
             setStatus(RecordingStatus.IDLE);
+
+            // Resuming already sent the user back to the recording page
+            if (resumeRequestedRef.current) {
+              return;
+            }
+
+            // `merged` tells the meeting page the summary is now stale: it covers
+            // only the first stretch of a conversation that just grew
+            const mergedParam = appendedToMeetingId ? '&merged=true' : '';
+            router.push(`/meeting-details?id=${meetingId}&source=recording${mergedParam}`);
+            Analytics.trackPageView('meeting_details');
           }, 2000);
           // Track meeting completion analytics
           try {
@@ -435,6 +595,8 @@ export function useRecordingStop(
     meetings,
     setIsMeetingActive,
     router,
+    resumeFromToast,
+    attachScreenshots,
   ]);
 
   // Expose handleRecordingStop function to window for Rust callbacks

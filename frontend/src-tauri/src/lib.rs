@@ -658,6 +658,13 @@ pub fn run() {
             api::api_get_meeting_transcripts,
             api::api_save_meeting_title,
             api::api_save_transcript,
+            api::api_append_transcript,
+            api::api_merge_resumed_recording,
+            // Screenshot context captured during a meeting
+            api::screenshots::api_extract_screenshot_context,
+            api::screenshots::api_attach_meeting_screenshots,
+            api::screenshots::api_get_meeting_screenshots,
+            api::screenshots::api_delete_meeting_screenshot,
             api::open_meeting_folder,
             api::test_backend_connection,
             api::debug_backend_connection,
@@ -699,6 +706,8 @@ pub fn run() {
             audio::recording_preferences::get_current_audio_backend,
             audio::recording_preferences::set_audio_backend,
             audio::recording_preferences::get_audio_backend_info,
+            // Call detection (auto-stop when the meeting call ends)
+            audio::call_detector::get_call_detection_support,
             // Language preference commands
             set_language_preference,
             // Notification system commands
