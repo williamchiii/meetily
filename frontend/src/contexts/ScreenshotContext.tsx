@@ -1,6 +1,6 @@
 'use client';
 
-import React, { createContext, useCallback, useContext, useMemo, useState } from 'react';
+import React, { createContext, useCallback, useContext, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 
@@ -67,6 +67,21 @@ export function ScreenshotProvider({ children }: { children: React.ReactNode }) 
   const [screenshots, setScreenshots] = useState<PendingScreenshot[]>([]);
   const [isExtracting, setIsExtracting] = useState(false);
 
+  // Mirrors `screenshots` synchronously (state updates are only visible on the
+  // next render), so code that needs the current list right after mutating it -
+  // like attachToMeeting - can read this instead.
+  const screenshotsRef = useRef<PendingScreenshot[]>([]);
+  const updateScreenshots = useCallback(
+    (updater: (prev: PendingScreenshot[]) => PendingScreenshot[]) => {
+      setScreenshots(prev => {
+        const next = updater(prev);
+        screenshotsRef.current = next;
+        return next;
+      });
+    },
+    []
+  );
+
   const addScreenshot = useCallback(async (file: File) => {
     if (!ACCEPTED_TYPES.includes(file.type)) {
       toast.error('That file is not an image', {
@@ -108,7 +123,7 @@ export function ScreenshotProvider({ children }: { children: React.ReactNode }) 
         note: '',
       };
 
-      setScreenshots(prev => [...prev, screenshot]);
+      updateScreenshots(prev => [...prev, screenshot]);
 
       toast.success('Screenshot added to the meeting context', {
         description: `${result.extracted_text.length} characters read by ${result.model}.`,
@@ -123,23 +138,19 @@ export function ScreenshotProvider({ children }: { children: React.ReactNode }) 
   }, []);
 
   const removeScreenshot = useCallback((id: string) => {
-    setScreenshots(prev => prev.filter(s => s.id !== id));
-  }, []);
+    updateScreenshots(prev => prev.filter(s => s.id !== id));
+  }, [updateScreenshots]);
 
   const setNote = useCallback((id: string, note: string) => {
-    setScreenshots(prev => prev.map(s => (s.id === id ? { ...s, note } : s)));
-  }, []);
+    updateScreenshots(prev => prev.map(s => (s.id === id ? { ...s, note } : s)));
+  }, [updateScreenshots]);
 
-  const clearScreenshots = useCallback(() => setScreenshots([]), []);
+  const clearScreenshots = useCallback(() => updateScreenshots(() => []), [updateScreenshots]);
 
   const attachToMeeting = useCallback(async (meetingId: string) => {
-    // Read from state at call time rather than closing over it, so a screenshot
+    // Read from the ref rather than closing over `screenshots`, so a screenshot
     // added moments before the stop is not left behind
-    let pending: PendingScreenshot[] = [];
-    setScreenshots(current => {
-      pending = current;
-      return current;
-    });
+    const pending = screenshotsRef.current;
 
     if (pending.length === 0) {
       return 0;
@@ -155,9 +166,9 @@ export function ScreenshotProvider({ children }: { children: React.ReactNode }) 
       })),
     });
 
-    setScreenshots([]);
+    updateScreenshots(() => []);
     return attached;
-  }, []);
+  }, [updateScreenshots]);
 
   const value = useMemo(
     () => ({

@@ -279,11 +279,16 @@ async fn auto_stop<R: Runtime>(app: &AppHandle<R>, apps: &[String]) {
     .await;
 
     match result {
-        Ok(_) => {
+        Ok(true) => {
             info!("📞 Recording stopped automatically after call end");
             if let Err(e) = app.emit("recording-stop-complete", true) {
                 error!("📞 Failed to emit recording-stop-complete: {}", e);
             }
+        }
+        // Something else (a manual stop, another tray toggle) already stopped it
+        // first - do not emit a second recording-stop-complete for the same recording.
+        Ok(false) => {
+            info!("📞 Recording was already stopped before auto-stop ran, skipping duplicate event");
         }
         Err(e) => error!("📞 Auto-stop failed to stop recording: {}", e),
     }

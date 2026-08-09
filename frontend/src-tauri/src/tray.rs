@@ -86,7 +86,7 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
 
             // Handle result
             match stop_result {
-                Ok(_) => {
+                Ok(true) => {
                     log::info!("Tray toggle: Recording stopped successfully");
 
                     // Trigger frontend post-processing via event (works from any page)
@@ -94,6 +94,14 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
                     if let Err(e) = app_clone.emit("recording-stop-complete", true) {
                         log::error!("Tray toggle: Failed to emit recording-stop-complete event: {}", e);
                     }
+                }
+                // Already stopped by something else (auto-stop, the other handler) -
+                // avoid emitting a second recording-stop-complete for it, but the tray
+                // was already set to "Stopping..." above and needs refreshing or it
+                // stays stuck there.
+                Ok(false) => {
+                    log::info!("Tray toggle: Recording was already stopped, skipping duplicate event");
+                    update_tray_menu_async(&app_clone).await;
                 }
                 Err(e) => {
                     log::error!("Tray toggle: Failed to stop recording: {}", e);
@@ -182,7 +190,7 @@ fn stop_recording_handler<R: Runtime>(app: &AppHandle<R>) {
 
         // Handle result
         match stop_result {
-            Ok(_) => {
+            Ok(true) => {
                 log::info!("Tray: Recording stopped successfully");
 
                 // Trigger frontend post-processing via event (works from any page)
@@ -190,6 +198,12 @@ fn stop_recording_handler<R: Runtime>(app: &AppHandle<R>) {
                 if let Err(e) = app_clone.emit("recording-stop-complete", true) {
                     log::error!("Tray: Failed to emit recording-stop-complete event: {}", e);
                 }
+            }
+            // Already stopped by something else - avoid emitting a duplicate event, but
+            // still refresh the tray so it doesn't stay stuck on "Stopping...".
+            Ok(false) => {
+                log::info!("Tray: Recording was already stopped, skipping duplicate event");
+                update_tray_menu_async(&app_clone).await;
             }
             Err(e) => {
                 log::error!("Tray: Failed to stop recording: {}", e);

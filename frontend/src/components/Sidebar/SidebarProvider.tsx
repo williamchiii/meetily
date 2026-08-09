@@ -7,14 +7,6 @@ import { invoke } from '@tauri-apps/api/core';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 
 
-interface SidebarItem {
-  id: string;
-  title: string;
-  type: 'folder' | 'file';
-  children?: SidebarItem[];
-  created_at?: string;
-}
-
 export interface CurrentMeeting {
   id: string;
   title: string;
@@ -41,7 +33,6 @@ interface TranscriptSearchResult {
 interface SidebarContextType {
   currentMeeting: CurrentMeeting | null;
   setCurrentMeeting: (meeting: CurrentMeeting | null) => void;
-  sidebarItems: SidebarItem[];
   isCollapsed: boolean;
   toggleCollapse: () => void;
   // Resizable sidebar (expanded width in px, persisted)
@@ -82,6 +73,10 @@ const SIDEBAR_WIDTH_KEY = 'meetily-sidebar-width';
 const SIDEBAR_WIDTH_DEFAULT = 256;
 const clampSidebarWidth = (width: number) => Math.min(420, Math.max(200, width));
 
+/** Width of the icon rail shown when the sidebar is collapsed - shared with
+ * MainContent so its margin stays in sync with what the sidebar actually renders. */
+export const SIDEBAR_COLLAPSED_WIDTH = 56;
+
 export const useSidebar = () => {
   const context = useContext(SidebarContext);
   if (!context) {
@@ -111,7 +106,6 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   }, []);
   const [meetings, setMeetings] = useState<CurrentMeeting[]>([]);
   const [folders, setFolders] = useState<Folder[]>([]);
-  const [sidebarItems, setSidebarItems] = useState<SidebarItem[]>([]);
   const [isMeetingActive, setIsMeetingActive] = useState(false);
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -221,18 +215,6 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     fetchSettings();
   }, []);
 
-  const baseItems: SidebarItem[] = [
-    {
-      id: 'meetings',
-      title: 'Meeting Notes',
-      type: 'folder' as const,
-      children: [
-        ...meetings.map(meeting => ({ id: meeting.id, title: meeting.title, type: 'file' as const, created_at: meeting.created_at }))
-      ]
-    },
-  ];
-
-
   const toggleCollapse = () => {
     setIsCollapsed(!isCollapsed);
   };
@@ -242,13 +224,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     if (pathname === '/') {
       setCurrentMeeting({ id: 'intro-call', title: '+ New Call' });
     }
-    setSidebarItems(baseItems);
   }, [pathname]);
-
-  // Update sidebar items when meetings change
-  useEffect(() => {
-    setSidebarItems(baseItems);
-  }, [meetings]);
 
   // Function to handle recording toggle from sidebar
   const handleRecordingToggle = () => {
@@ -401,7 +377,6 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     <SidebarContext.Provider value={{
       currentMeeting,
       setCurrentMeeting,
-      sidebarItems,
       isCollapsed,
       toggleCollapse,
       sidebarWidth,

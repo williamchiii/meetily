@@ -486,17 +486,19 @@ export function useRecordingStop(
 
           // Auto-navigate after a short delay with source parameter
           setTimeout(() => {
-            // This meeting is finished either way, so release its transcripts and
-            // status before deciding where to send the user - skipping the cleanup
-            // on the resume path would leave the finished meeting's segments in the
-            // shared list and the status pinned at COMPLETED
-            clearTranscripts();
-            setStatus(RecordingStatus.IDLE);
-
-            // Resuming already sent the user back to the recording page
+            // Resuming already sent the user back to the recording page, and a new
+            // recording may already be under way - clearing/navigating now would
+            // clobber its transcripts and status instead of this finished meeting's
             if (resumeRequestedRef.current) {
               return;
             }
+
+            // This meeting is finished, so release its transcripts and status
+            // before deciding where to send the user - skipping this would leave
+            // the finished meeting's segments in the shared list and the status
+            // pinned at COMPLETED
+            clearTranscripts();
+            setStatus(RecordingStatus.IDLE);
 
             // `merged` tells the meeting page the summary is now stale: it covers
             // only the first stretch of a conversation that just grew

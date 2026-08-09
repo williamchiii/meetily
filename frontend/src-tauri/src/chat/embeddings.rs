@@ -113,6 +113,27 @@ pub(crate) fn chunk_transcript(segments: &[String]) -> Vec<String> {
             current.push('\n');
         }
         current.push_str(segment);
+
+        // A single segment can itself exceed CHUNK_CHARS (e.g. one long
+        // uninterrupted speaker turn with no natural break); slice it on
+        // fixed-size windows too, rather than emitting one arbitrarily large chunk.
+        debug_assert!(
+            CHUNK_OVERLAP_CHARS < CHUNK_CHARS,
+            "CHUNK_OVERLAP_CHARS must stay smaller than CHUNK_CHARS or the window below never advances"
+        );
+        while current.chars().count() > CHUNK_CHARS {
+            let chars: Vec<char> = current.chars().collect();
+            let prefix: String = chars[..CHUNK_CHARS].iter().collect();
+            // Clamped so the window always advances by at least one char, even if a
+            // future tuning change makes CHUNK_OVERLAP_CHARS >= CHUNK_CHARS.
+            let overlap = CHUNK_OVERLAP_CHARS.min(CHUNK_CHARS.saturating_sub(1));
+            let overlap_start = CHUNK_CHARS - overlap;
+            let mut next = String::new();
+            next.extend(&chars[overlap_start..CHUNK_CHARS]);
+            next.extend(&chars[CHUNK_CHARS..]);
+            chunks.push(prefix);
+            current = next;
+        }
     }
     if !current.trim().is_empty() {
         chunks.push(current);
@@ -300,6 +321,20 @@ mod tests {
             .skip(chunks[0].chars().count() - 50)
             .collect();
         assert!(chunks[1].starts_with(tail.chars().take(20).collect::<String>().as_str()));
+    }
+
+    #[test]
+    fn chunk_transcript_splits_a_single_oversized_segment() {
+        // One uninterrupted speaker turn longer than CHUNK_CHARS, with no other
+        // segment to trigger the normal accumulation split.
+        let segment = "word ".repeat(400).trim().to_string(); // ~2000 chars
+        let chunks = chunk_transcript(&[segment.clone()]);
+        assert!(chunks.len() >= 2, "expected the oversized segment to be split");
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= CHUNK_CHARS);
+        }
+        // Nothing from the middle of the segment is silently dropped between chunks.
+        assert!(segment.contains(chunks[0].split_whitespace().last().unwrap()));
     }
 
     #[test]

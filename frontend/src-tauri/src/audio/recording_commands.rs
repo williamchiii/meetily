@@ -486,10 +486,14 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 }
 
 /// Stop recording with optimized graceful shutdown ensuring NO transcript chunks are lost
+/// Stops the active recording. Returns `Ok(true)` if a recording was actually
+/// stopped, or `Ok(false)` if one was not active (a no-op) - callers must not
+/// treat the no-op case as a fresh stop, or they will emit a duplicate
+/// `recording-stop-complete` for a recording that already finished shutting down.
 pub async fn stop_recording<R: Runtime>(
     app: AppHandle<R>,
     _args: RecordingArgs,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     info!(
         "🛑 Starting optimized recording shutdown - ensuring ALL transcript chunks are preserved"
     );
@@ -500,7 +504,7 @@ pub async fn stop_recording<R: Runtime>(
     // Check if recording is active
     if !IS_RECORDING.load(Ordering::SeqCst) {
         info!("Recording was not active");
-        return Ok(());
+        return Ok(false);
     }
 
     // Emit shutdown progress to frontend
@@ -902,7 +906,7 @@ pub async fn stop_recording<R: Runtime>(
     crate::tray::update_tray_menu(&app);
 
     info!("🎉 Recording stopped successfully with ZERO transcript chunks lost");
-    Ok(())
+    Ok(true)
 }
 
 /// Check if recording is active

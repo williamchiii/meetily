@@ -561,7 +561,9 @@ pub async fn chat_ask<R: Runtime>(
     }
 
     // Merge: meetings found by both signals rank first, then semantic-only
-    // (by score), then keyword-only (already ranked).
+    // (by score), then keyword-only (already ranked) - all three tiers are
+    // sorted together so a strong semantic-only match can't be pushed out by
+    // truncation before a weak keyword-only one.
     let mut context: Vec<(String, MeetingContext)> = Vec::new();
     let keyword_ids: HashSet<String> = keyword_ranked.iter().map(|(id, _)| id.clone()).collect();
     for (id, mut meeting) in keyword_ranked {
@@ -571,14 +573,6 @@ pub async fn chat_ask<R: Runtime>(
         }
         context.push((id, meeting));
     }
-    context.sort_by(|a, b| {
-        let both_a = (a.1.semantic_score > 0.0) as u8 + (a.1.keyword_count > 0) as u8;
-        let both_b = (b.1.semantic_score > 0.0) as u8 + (b.1.keyword_count > 0) as u8;
-        both_b
-            .cmp(&both_a)
-            .then_with(|| b.1.keyword_count.cmp(&a.1.keyword_count))
-            .then_with(|| b.1.hit_count.cmp(&a.1.hit_count))
-    });
     for hit in semantic_hits {
         if !keyword_ids.contains(&hit.meeting_id) {
             context.push((
@@ -593,6 +587,25 @@ pub async fn chat_ask<R: Runtime>(
             ));
         }
     }
+    context.sort_by(|a, b| {
+        fn tier(m: &MeetingContext) -> u8 {
+            match (m.semantic_score > 0.0, m.keyword_count > 0) {
+                (true, true) => 0,
+                (true, false) => 1,
+                (false, true) => 2,
+                (false, false) => 3,
+            }
+        }
+        tier(&a.1)
+            .cmp(&tier(&b.1))
+            .then_with(|| b.1.keyword_count.cmp(&a.1.keyword_count))
+            .then_with(|| {
+                b.1.semantic_score
+                    .partial_cmp(&a.1.semantic_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| b.1.hit_count.cmp(&a.1.hit_count))
+    });
     context.truncate(MAX_CONTEXT_MEETINGS);
 
     let recents = recent_meetings(pool).await?;

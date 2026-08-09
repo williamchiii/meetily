@@ -131,7 +131,6 @@ async fn save_alongside_recording(
         .ok()?;
 
     let dir = std::path::Path::new(&folder).join("screenshots");
-    std::fs::create_dir_all(&dir).ok()?;
 
     let extension = match mime_type {
         "image/jpeg" | "image/jpg" => "jpg",
@@ -150,13 +149,22 @@ async fn save_alongside_recording(
 
     let path = dir.join(format!("{}-{}.{}", stamp, stem, extension));
 
-    match std::fs::write(&path, &bytes) {
-        Ok(_) => Some(path.to_string_lossy().to_string()),
-        Err(e) => {
-            log_error!("Could not save screenshot image: {}", e);
-            None
+    // Disk I/O off the async runtime thread, same as recording_commands.rs does
+    // for equivalent work - this can run while a recording is actively writing to
+    // the same folder.
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&dir).ok()?;
+        match std::fs::write(&path, &bytes) {
+            Ok(_) => Some(path.to_string_lossy().to_string()),
+            Err(e) => {
+                log_error!("Could not save screenshot image: {}", e);
+                None
+            }
         }
-    }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Keep a user-supplied file name from escaping the screenshots directory.

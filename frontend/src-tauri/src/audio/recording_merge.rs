@@ -66,6 +66,7 @@ pub fn merge_recording_folders(
     meeting_folder: &Path,
     resumed_folder: &Path,
     recordings_root: &Path,
+    home_dir: Option<&Path>,
 ) -> Result<MergeReport> {
     if meeting_folder == resumed_folder {
         return Ok(MergeReport::skipped(
@@ -113,7 +114,7 @@ pub fn merge_recording_folders(
         update_metadata_duration(meeting_folder, duration)?;
     }
 
-    let retired_to = retire_folder(resumed_folder, recordings_root)
+    let retired_to = retire_folder(resumed_folder, recordings_root, home_dir)
         .map_err(|e| warn!("Merged {} but could not retire it: {}", resumed_folder.display(), e))
         .ok()
         .flatten();
@@ -179,6 +180,10 @@ fn concat_audio(first: &Path, second: &Path, work_dir: &Path) -> Result<f64> {
 
     let stream_copy_ok = copied.is_ok() && duration_matches(&merged_tmp, expected);
 
+    // The concat list is only used by the stream-copy attempt above; clean it up now
+    // regardless of what happens next, so a re-encode failure below doesn't skip it.
+    let _ = std::fs::remove_file(&list_file);
+
     if !stream_copy_ok {
         // Parameters differ (a device change mid-meeting, an imported file); fall
         // back to re-encoding, which does not care whether they line up
@@ -197,8 +202,6 @@ fn concat_audio(first: &Path, second: &Path, work_dir: &Path) -> Result<f64> {
         )
         .context("re-encoding merged audio")?;
     }
-
-    let _ = std::fs::remove_file(&list_file);
 
     let merged_duration = probe_duration(&merged_tmp)
         .ok_or_else(|| anyhow!("merged audio has no readable duration"))?;
@@ -393,7 +396,11 @@ fn write_json_atomically(path: &Path, value: &serde_json::Value) -> Result<()> {
 /// The root is passed in rather than derived here: recordings go to the user's
 /// configured save folder, which the Settings UI can move away from the per-platform
 /// default, and deriving the wrong root would refuse every legitimate retirement.
-fn retire_folder(folder: &Path, recordings_root: &Path) -> Result<Option<PathBuf>> {
+fn retire_folder(
+    folder: &Path,
+    recordings_root: &Path,
+    home_dir: Option<&Path>,
+) -> Result<Option<PathBuf>> {
     let folder_real = folder.canonicalize().context("resolving folder to retire")?;
     let root_real = recordings_root
         .canonicalize()
@@ -406,7 +413,7 @@ fn retire_folder(folder: &Path, recordings_root: &Path) -> Result<Option<PathBuf
         ));
     }
 
-    let Some(trash) = trash_dir() else {
+    let Some(trash) = trash_dir(home_dir) else {
         return Ok(None);
     };
     std::fs::create_dir_all(&trash).ok();
@@ -432,14 +439,17 @@ fn retire_folder(folder: &Path, recordings_root: &Path) -> Result<Option<PathBuf
 }
 
 /// The user's Trash, on platforms that have one we can move into directly.
-fn trash_dir() -> Option<PathBuf> {
+/// `home_dir` should come from Tauri's path resolver (`AppHandle::path().home_dir()`)
+/// rather than being resolved here, per this project's path-API convention.
+fn trash_dir(home_dir: Option<&Path>) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        dirs::home_dir().map(|home| home.join(".Trash"))
+        home_dir.map(|home| home.join(".Trash"))
     }
 
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = home_dir;
         // Elsewhere the merged-from folder is left in place rather than guessing at
         // a trash implementation; the caller reports the path instead.
         None
@@ -511,7 +521,8 @@ mod tests {
         )
         .unwrap();
 
-        let report = merge_recording_folders(meeting.path(), resumed.path(), meeting.path()).unwrap();
+        let report =
+            merge_recording_folders(meeting.path(), resumed.path(), meeting.path(), None).unwrap();
 
         assert!(report.merged, "{}", report.detail);
 
@@ -558,7 +569,8 @@ mod tests {
             return;
         }
 
-        let report = merge_recording_folders(meeting.path(), resumed.path(), meeting.path()).unwrap();
+        let report =
+            merge_recording_folders(meeting.path(), resumed.path(), meeting.path(), None).unwrap();
 
         assert!(report.merged, "{}", report.detail);
         let duration = probe_duration(&meeting.path().join("audio.mp4")).unwrap();
@@ -578,7 +590,7 @@ mod tests {
 
         // Whether this errors or salvages something, the meeting's own audio must
         // never be left destroyed or truncated
-        let _ = merge_recording_folders(meeting.path(), resumed.path(), meeting.path());
+        let _ = merge_recording_folders(meeting.path(), resumed.path(), meeting.path(), None);
 
         let surviving = probe_duration(&meeting.path().join("audio.mp4"));
         assert!(
@@ -623,7 +635,9 @@ mod tests {
         )
         .unwrap();
 
-        let report = merge_recording_folders(&meeting, &resumed, root.path()).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let report =
+            merge_recording_folders(&meeting, &resumed, root.path(), Some(home.path())).unwrap();
 
         assert!(report.merged, "merge must proceed without audio: {}", report.detail);
         assert_eq!(report.duration_seconds, None, "there was no audio to time");
@@ -654,13 +668,13 @@ mod tests {
         std::fs::create_dir_all(&resumed).unwrap();
 
         // The folder lives under the configured root, so this is allowed
-        assert!(retire_folder(&resumed, root.path()).is_ok());
+        assert!(retire_folder(&resumed, root.path(), None).is_ok());
     }
 
     #[test]
     fn identical_folders_are_a_no_op() {
         let dir = tempfile::tempdir().unwrap();
-        let report = merge_recording_folders(dir.path(), dir.path(), dir.path()).unwrap();
+        let report = merge_recording_folders(dir.path(), dir.path(), dir.path(), None).unwrap();
         assert!(!report.merged);
     }
 
@@ -676,7 +690,7 @@ mod tests {
         // take has none. There is nothing to concatenate, but the merge proceeds.
         std::fs::write(meeting.join("audio.mp4"), b"existing audio bytes").unwrap();
 
-        let report = merge_recording_folders(&meeting, &resumed, root.path()).unwrap();
+        let report = merge_recording_folders(&meeting, &resumed, root.path(), None).unwrap();
 
         assert!(report.merged, "got {}", report.detail);
         assert_eq!(report.duration_seconds, None);
@@ -690,7 +704,7 @@ mod tests {
     #[test]
     fn refuses_to_retire_a_folder_outside_the_recordings_root() {
         let stray = tempfile::tempdir().unwrap();
-        assert!(retire_folder(stray.path(), stray.path()).is_err());
+        assert!(retire_folder(stray.path(), stray.path(), None).is_err());
         assert!(stray.path().is_dir(), "the folder must be left alone");
     }
 

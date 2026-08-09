@@ -3,7 +3,7 @@
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { File, Settings, Home, Trash2, Mic, Square, Pencil, NotebookPen, SearchIcon, X, Upload, Folder as FolderIcon, FolderPlus, PanelLeft, MessageCircle } from 'lucide-react';
 import { useRouter, usePathname, useSearchParams } from 'next/navigation';
-import { useSidebar } from './SidebarProvider';
+import { useSidebar, SIDEBAR_COLLAPSED_WIDTH } from './SidebarProvider';
 import { ConfirmationModal } from '../ConfirmationModel/confirmation-modal';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { SettingTabs } from '../SettingTabs';
@@ -385,8 +385,8 @@ const Sidebar: React.FC = () => {
       </button>
 
       <div
-        className={`h-screen bg-sidebar shadow-sm flex flex-col relative overflow-hidden ${isCollapsed ? '' : 'border-r'} ${isResizingSidebar ? '' : 'transition-all duration-300'}`}
-        style={{ width: isCollapsed ? 0 : sidebarWidth }}
+        className={`h-screen bg-sidebar shadow-sm flex flex-col relative overflow-hidden border-r ${isResizingSidebar ? '' : 'transition-all duration-300'}`}
+        style={{ width: isCollapsed ? SIDEBAR_COLLAPSED_WIDTH : sidebarWidth }}
       >
         {/* Resize handle */}
         {!isCollapsed && (
@@ -399,6 +399,48 @@ const Sidebar: React.FC = () => {
 
         {/* Clearance for the fixed toggle button */}
         <div className="flex-shrink-0 h-11" />
+
+        {/* Collapsed icon rail - quick actions stay reachable without expanding */}
+        {isCollapsed && (
+          <div className="flex flex-col items-center gap-1 px-1.5">
+            <button
+              onClick={() => router.push('/')}
+              className="w-9 h-9 flex items-center justify-center rounded-lg text-gray-500 hover:text-gray-700 hover:bg-gray-100 transition-colors"
+              aria-label="Home"
+              title="Home"
+            >
+              <Home className="w-[18px] h-[18px]" />
+            </button>
+            <button
+              onClick={handleRecordingToggle}
+              disabled={isRecording}
+              className={`w-9 h-9 flex items-center justify-center rounded-lg text-white transition-colors ${isRecording ? 'bg-red-300 cursor-not-allowed' : 'bg-red-500 hover:bg-red-600'}`}
+              aria-label={isRecording ? 'Recording in progress' : 'Start Recording'}
+              title={isRecording ? 'Recording in progress' : 'Start Recording'}
+            >
+              {isRecording ? <Square className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+            </button>
+            {betaFeatures.importAndRetranscribe && (
+              <button
+                onClick={() => openImportDialog()}
+                className="w-9 h-9 flex items-center justify-center rounded-lg text-gray-700 bg-blue-100 hover:bg-blue-200 transition-colors"
+                aria-label="Import Audio"
+                title="Import Audio"
+              >
+                <Upload className="w-4 h-4" />
+              </button>
+            )}
+            <button
+              onClick={() => router.push('/settings')}
+              className="w-9 h-9 flex items-center justify-center rounded-lg text-gray-700 bg-gray-200 hover:bg-gray-300 transition-colors"
+              aria-label="Settings"
+              title="Settings"
+            >
+              <Settings className="w-4 h-4" />
+            </button>
+            <Info isCollapsed={isCollapsed} />
+          </div>
+        )}
 
         <div className="flex-shrink-0">
           <div className="flex-1">

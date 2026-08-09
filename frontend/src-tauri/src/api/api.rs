@@ -1,7 +1,7 @@
 use log::{debug as log_debug, error as log_error, info as log_info, warn as log_warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_store::StoreExt;
 
 use crate::{
@@ -1209,11 +1209,16 @@ pub async fn api_merge_resumed_recording<R: Runtime>(
             }
         };
 
+    // Resolved via Tauri's path API rather than inside recording_merge, per this
+    // project's "never hardcode paths" convention.
+    let home_dir = app.path().home_dir().ok();
+
     let report = tokio::task::spawn_blocking(move || {
         crate::audio::recording_merge::merge_recording_folders(
             std::path::Path::new(&meeting_folder),
             std::path::Path::new(&resumed_folder_path),
             &recordings_root,
+            home_dir.as_deref(),
         )
     })
     .await

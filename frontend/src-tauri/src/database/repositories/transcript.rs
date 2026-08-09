@@ -123,13 +123,21 @@ impl TranscriptsRepository {
             return Err(SqlxError::Protocol("meeting_id cannot be empty".to_string()));
         }
 
+        let mut conn = pool.acquire().await?;
+        // BEGIN IMMEDIATE takes SQLite's write lock up front, so a second append
+        // for the same meeting (e.g. a stray duplicate stop event) blocks here
+        // instead of both racing to read the same stale MAX(offset) before either
+        // commits, which would shift their segments to overlap on the timeline.
+        let mut transaction = conn.begin_with("BEGIN IMMEDIATE").await?;
+
         let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM meetings WHERE id = ?")
             .bind(meeting_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *transaction)
             .await?;
 
         if exists.is_none() {
             error!("Cannot append transcripts, meeting {} not found", meeting_id);
+            transaction.rollback().await?;
             return Err(SqlxError::RowNotFound);
         }
 
@@ -137,13 +145,10 @@ impl TranscriptsRepository {
             "SELECT MAX(COALESCE(audio_end_time, audio_start_time)) FROM transcripts WHERE meeting_id = ?",
         )
         .bind(meeting_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *transaction)
         .await?;
 
         let offset = append_offset(offset);
-
-        let mut conn = pool.acquire().await?;
-        let mut transaction = conn.begin().await?;
 
         for segment in transcripts {
             let transcript_id = format!("transcript-{}", Uuid::new_v4());

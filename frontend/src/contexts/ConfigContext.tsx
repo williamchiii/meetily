@@ -136,8 +136,15 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     systemDevice: null
   });
 
-  // Language preference state
-  const [selectedLanguage, setSelectedLanguage] = useState<string>('auto');
+  // Language preference state - read synchronously so the first render (and the
+  // Rust-sync effect that runs alongside it) already has the saved value instead
+  // of briefly syncing 'auto' to Rust before a later effect corrects it
+  const [selectedLanguage, setSelectedLanguage] = useState<string>(() => {
+    if (typeof window === 'undefined') {
+      return 'auto';
+    }
+    return localStorage.getItem('primaryLanguage') || 'auto';
+  });
 
   // UI preferences state
   const [showConfidenceIndicator, setShowConfidenceIndicator] = useState<boolean>(true);
@@ -156,11 +163,6 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   const isLoadingRef = useRef(false);
 
   useEffect(() => {
-    const savedLanguage = localStorage.getItem('primaryLanguage');
-    if (savedLanguage) {
-      setSelectedLanguage(savedLanguage);
-    }
-
     const savedConfidenceIndicator = localStorage.getItem('showConfidenceIndicator');
     if (savedConfidenceIndicator !== null) {
       setShowConfidenceIndicator(savedConfidenceIndicator === 'true');

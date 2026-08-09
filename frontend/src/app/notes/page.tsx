@@ -52,6 +52,7 @@ function NotesContent() {
   const {
     meetings,
     folders,
+    currentMeeting,
     setCurrentMeeting,
     moveMeetingToFolder,
     refetchMeetings,
@@ -143,6 +144,10 @@ function NotesContent() {
       Analytics.trackMeetingDeleted(meetingId);
       await refetchMeetings();
       await refetchFolders();
+      // Don't leave currentMeeting pointing at a row that no longer exists
+      if (currentMeeting?.id === meetingId) {
+        setCurrentMeeting({ id: 'intro-call', title: '+ New Call' });
+      }
       toast.success('Meeting deleted', { description: 'All associated data has been removed' });
     } catch (error) {
       toast.error('Failed to delete meeting', {
