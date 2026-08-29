@@ -1,9 +1,10 @@
 'use client';
 
-import React, { useState, useMemo, useEffect, useCallback } from 'react';
-import { File, Settings, Home, Trash2, Mic, Square, Pencil, NotebookPen, SearchIcon, X, Upload, Folder as FolderIcon, FolderPlus, PanelLeft, MessageCircle } from 'lucide-react';
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
+import { File, Settings, Home, Trash2, Mic, Square, Pencil, NotebookPen, SearchIcon, X, Upload, Folder as FolderIcon, FolderPlus, FolderInput, PanelLeft, MessageCircle, ChevronRight, ChevronDown, CornerUpLeft, MoreHorizontal } from 'lucide-react';
 import { useRouter, usePathname, useSearchParams } from 'next/navigation';
 import { useSidebar, SIDEBAR_COLLAPSED_WIDTH } from './SidebarProvider';
+import type { Folder } from './SidebarProvider';
 import { ConfirmationModal } from '../ConfirmationModel/confirmation-modal';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { SettingTabs } from '../SettingTabs';
@@ -22,12 +23,76 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { VisuallyHidden } from "@/components/ui/visually-hidden"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import { buildFolderParentLabels, buildFolderTree, collectSubtreeIds, flattenFolderTree, folderPath, type FolderNode } from '@/lib/folderTree';
 
 import { MessageToast } from '../MessageToast';
 import Info from '../Info';
 import { ComplianceNotification } from '../ComplianceNotification';
 import { Input } from '../ui/input';
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from '../ui/input-group';
+
+const FOLDER_EXPANDED_KEY = 'meetily-expanded-folders';
+/** Deeper folders still nest; they just stop gaining left padding. */
+const MAX_INDENT_DEPTH = 8;
+
+interface FolderMoveTargetsProps {
+  folder: FolderNode;
+  folders: Folder[];
+  flatFolders: FolderNode[];
+  parentLabels: Map<string, string>;
+  onMove: (folderId: string, parentId: string | null) => void;
+}
+
+/**
+ * Destinations for one folder. Radix mounts a submenu only once it opens, so keeping the
+ * subtree scan in here means it runs on demand rather than for every row on every render.
+ */
+const FolderMoveTargets: React.FC<FolderMoveTargetsProps> = ({ folder, folders, flatFolders, parentLabels, onMove }) => {
+  // A folder cannot be moved into itself or anything nested below it
+  const ownSubtree = collectSubtreeIds(folders, folder.id);
+  const targets = flatFolders.filter(candidate => !ownSubtree.has(candidate.id));
+
+  return (
+    <>
+      <DropdownMenuItem
+        disabled={folder.parent_id === null}
+        onClick={() => onMove(folder.id, null)}
+      >
+        <CornerUpLeft className="w-4 h-4 mr-2" />
+        Top level
+      </DropdownMenuItem>
+      {targets.length > 0 && <DropdownMenuSeparator />}
+      {targets.map(target => {
+        const parentLabel = parentLabels.get(target.id);
+        return (
+          <DropdownMenuItem
+            key={target.id}
+            disabled={target.id === folder.parent_id}
+            onClick={() => onMove(folder.id, target.id)}
+          >
+            <FolderIcon className="w-4 h-4 mr-2 flex-shrink-0" />
+            <span className="truncate">{target.name}</span>
+            {/* Nesting makes duplicate leaf names normal, so name the branch too */}
+            {parentLabel && (
+              <span className="ml-2 text-xs text-gray-400 truncate">{parentLabel}</span>
+            )}
+          </DropdownMenuItem>
+        );
+      })}
+      {targets.length === 0 && <DropdownMenuItem disabled>No other folders</DropdownMenuItem>}
+    </>
+  );
+};
 
 const Sidebar: React.FC = () => {
   const router = useRouter();
@@ -49,6 +114,7 @@ const Sidebar: React.FC = () => {
     folders,
     createFolder,
     renameFolder,
+    moveFolder,
     deleteFolder,
     serverAddress
   } = useSidebar();
@@ -72,25 +138,53 @@ const Sidebar: React.FC = () => {
   });
   const [settingsSaveSuccess, setSettingsSaveSuccess] = useState<boolean | null>(null);
 
-  // Folder nav state (Granola-style sidebar)
-  const [activeFolderId, setActiveFolderId] = useState<string | null>(null);
-  const [isUncategorizedActive, setIsUncategorizedActive] = useState(false);
-  const [isCreatingFolder, setIsCreatingFolder] = useState(false);
+  // Folder nav state (Granola-style sidebar). The active view is derived from the URL
+  // rather than mirrored in state, so there is only ever one writer: the router.
+  const activeFolderId = pathname === '/notes' ? searchParams.get('folder') : null;
+  const isUncategorizedActive =
+    pathname === '/notes' && !activeFolderId && searchParams.get('view') === 'uncategorized';
+  // Inline "new folder" input; parentId null creates at the top level.
+  const [folderDraft, setFolderDraft] = useState<{ parentId: string | null } | null>(null);
   const [newFolderName, setNewFolderName] = useState('');
+  // Which folders are expanded in the tree. Everything starts collapsed on a fresh install.
+  const [expandedFolderIds, setExpandedFolderIds] = useState<Set<string>>(() => {
+    if (typeof window === 'undefined') return new Set();
+    try {
+      const stored = window.localStorage.getItem(FOLDER_EXPANDED_KEY);
+      const parsed = stored ? JSON.parse(stored) : null;
+      return new Set(Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : []);
+    } catch {
+      return new Set();
+    }
+  });
   const [folderRenameState, setFolderRenameState] = useState<{ isOpen: boolean; folderId: string | null }>({ isOpen: false, folderId: null });
   const [renamingFolderName, setRenamingFolderName] = useState('');
   const [folderDeleteState, setFolderDeleteState] = useState<{ isOpen: boolean; folderId: string | null }>({ isOpen: false, folderId: null });
 
-  // Keep the highlighted folder or virtual Uncategorized view in sync with the URL.
+  // Navigating to a folder should reveal the row it highlights. `undefined` is the first
+  // run: launching keeps the tree collapsed by design, so only later moves queue a reveal.
+  const lastUrlFolderId = useRef<string | null | undefined>(undefined);
+  const pendingExpandId = useRef<string | null>(null);
   useEffect(() => {
-    if (pathname === '/notes') {
-      setActiveFolderId(searchParams.get('folder'));
-      setIsUncategorizedActive(searchParams.get('view') === 'uncategorized');
-    } else {
-      setActiveFolderId(null);
-      setIsUncategorizedActive(false);
+    const previous = lastUrlFolderId.current;
+    lastUrlFolderId.current = activeFolderId;
+    if (previous !== undefined && activeFolderId && activeFolderId !== previous) {
+      pendingExpandId.current = activeFolderId;
     }
-  }, [pathname, searchParams]);
+  }, [activeFolderId]);
+
+  // Also keyed on `folders`, so a navigation that lands before the list loads (or before a
+  // freshly created folder is refetched) still opens its branch once the folder is known.
+  useEffect(() => {
+    const folderId = pendingExpandId.current;
+    if (!folderId || !folders.some(folder => folder.id === folderId)) return;
+    pendingExpandId.current = null;
+    expandTo(folderId);
+  }, [folders, activeFolderId]);
+
+  // "New subfolder" mounts an autofocused input while the menu is closing; Radix would
+  // hand focus back to the trigger and the input's onBlur would discard the draft.
+  const suppressMenuRefocus = useRef(false);
 
   // useEffect(() => {
   //   if (settingsSaveSuccess !== null) {
@@ -257,6 +351,31 @@ const Sidebar: React.FC = () => {
       .sort((a, b) => new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime());
   }, [searchQuery, searchResults, meetings]);
 
+  // Nested folder tree, sorted by name at every level.
+  const folderTree = useMemo(() => buildFolderTree(folders), [folders]);
+  const flatFolders = useMemo(() => flattenFolderTree(folderTree), [folderTree]);
+  const folderParentLabels = useMemo(() => buildFolderParentLabels(folders), [folders]);
+
+  // Drop ids of deleted folders, otherwise the stored list grows with every folder ever
+  // expanded. Skipped while the list is empty so the first render cannot wipe it.
+  useEffect(() => {
+    if (folders.length === 0) return;
+    setExpandedFolderIds(prev => {
+      const live = new Set(folders.map(folder => folder.id));
+      const kept = [...prev].filter(id => live.has(id));
+      return kept.length === prev.size ? prev : new Set(kept);
+    });
+  }, [folders]);
+
+  // Persist expansion so the tree looks the same on the next launch.
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(FOLDER_EXPANDED_KEY, JSON.stringify([...expandedFolderIds]));
+    } catch {
+      // Persistence is best-effort
+    }
+  }, [expandedFolderIds]);
+
   // Meetings without a folder stay easy to find without being mixed into the folder list.
   const uncategorizedMeetings = useMemo(() => {
     return meetings
@@ -267,37 +386,85 @@ const Sidebar: React.FC = () => {
 
   // ----- Folder navigation & CRUD -----
 
-  const openAllNotes = () => {
-    setActiveFolderId(null);
-    setIsUncategorizedActive(false);
-    router.push('/notes');
+  const openAllNotes = () => router.push('/notes');
+
+  const openUncategorized = () => router.push('/notes?view=uncategorized');
+
+  const openFolder = (folderId: string) => router.push(`/notes?folder=${folderId}`);
+
+  /**
+   * Open the branch leading to a folder so its row is on screen. `includeSelf` also opens
+   * the folder itself, for when something is about to appear inside it.
+   */
+  const expandTo = (folderId: string, includeSelf = false) => {
+    const path = folderPath(folders, folderId);
+    const ids = (includeSelf ? path : path.slice(0, -1)).map(folder => folder.id);
+    if (ids.length === 0) return;
+    setExpandedFolderIds(prev => {
+      const next = new Set(prev);
+      ids.forEach(id => next.add(id));
+      return next.size === prev.size ? prev : next;
+    });
   };
 
-  const openUncategorized = () => {
-    setActiveFolderId(null);
-    setIsUncategorizedActive(true);
-    router.push('/notes?view=uncategorized');
+  const toggleFolderExpanded = (folderId: string) => {
+    setExpandedFolderIds(prev => {
+      const next = new Set(prev);
+      if (next.has(folderId)) next.delete(folderId);
+      else next.add(folderId);
+      return next;
+    });
   };
 
-  const openFolder = (folderId: string) => {
-    setActiveFolderId(folderId);
-    setIsUncategorizedActive(false);
-    router.push(`/notes?folder=${folderId}`);
+  /** Open the inline name input, either at the top level (null) or inside a folder. */
+  const startFolderDraft = (parentId: string | null) => {
+    setNewFolderName('');
+    setFolderDraft({ parentId });
+    // Otherwise the new row would be typed into a collapsed branch
+    if (parentId) expandTo(parentId, true);
   };
 
   const handleCreateFolder = async () => {
     const name = newFolderName.trim();
-    setIsCreatingFolder(false);
+    const parentId = folderDraft?.parentId ?? null;
+    setFolderDraft(null);
     setNewFolderName('');
     if (!name) return;
 
-    const folder = await createFolder(name);
+    const folder = await createFolder(name, parentId);
     if (folder) {
-      Analytics.trackButtonClick('create_folder', 'sidebar');
+      Analytics.trackButtonClick(parentId ? 'create_subfolder' : 'create_folder', 'sidebar');
       openFolder(folder.id);
     } else {
       toast.error('Failed to create folder');
     }
+  };
+
+  const handleMoveFolder = async (folderId: string, parentId: string | null) => {
+    const result = await moveFolder(folderId, parentId);
+    if (!result.ok) {
+      toast.error('Failed to move folder', { description: result.error });
+      return;
+    }
+
+    if (parentId) {
+      // Without opening the whole chain the folder lands somewhere collapsed and looks lost
+      expandTo(parentId, true);
+      toast.success(`Moved into ${folders.find(f => f.id === parentId)?.name ?? 'folder'}`);
+    } else {
+      toast.success('Moved to top level');
+    }
+  };
+
+  // Deleting is blocked while subfolders remain, so say that before opening the modal.
+  const requestFolderDelete = (node: FolderNode) => {
+    if (node.children.length > 0) {
+      toast.error('Folder is not empty', {
+        description: `Move or delete its ${node.children.length} subfolder${node.children.length === 1 ? '' : 's'} first.`,
+      });
+      return;
+    }
+    setFolderDeleteState({ isOpen: true, folderId: node.id });
   };
 
   const handleFolderRenameConfirm = async () => {
@@ -325,15 +492,146 @@ const Sidebar: React.FC = () => {
     setFolderDeleteState({ isOpen: false, folderId: null });
     if (!folderId) return;
 
-    const ok = await deleteFolder(folderId);
-    if (ok) {
+    const result = await deleteFolder(folderId);
+    if (result.ok) {
       toast.success('Folder deleted', { description: 'Its meetings were moved to All Notes' });
       if (activeFolderId === folderId) {
         openAllNotes();
       }
     } else {
-      toast.error('Failed to delete folder');
+      toast.error('Failed to delete folder', { description: result.error });
     }
+  };
+
+  // Indent one step per nesting level, but stop stepping past MAX_INDENT_DEPTH: nesting is
+  // unlimited while the sidebar is 200-420px wide, and a runaway indent would push a row's
+  // name, count and actions menu off the edge where they cannot be reached at all.
+  const folderRowPadding = (depth: number) => 12 + Math.min(depth, MAX_INDENT_DEPTH) * 14;
+
+  const renderFolderDraft = (depth: number) => (
+    <div
+      style={{ paddingLeft: folderRowPadding(depth) }}
+      className="pr-2 py-1.5 rounded-md text-sm flex items-center bg-gray-100"
+    >
+      <span className="w-[22px] flex-shrink-0" />
+      <FolderIcon className="w-4 h-4 mr-2 flex-shrink-0 text-gray-500" />
+      <input
+        autoFocus
+        value={newFolderName}
+        onChange={(e) => setNewFolderName(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') handleCreateFolder();
+          if (e.key === 'Escape') { setFolderDraft(null); setNewFolderName(''); }
+        }}
+        onBlur={handleCreateFolder}
+        placeholder="Folder name"
+        className="flex-1 min-w-0 bg-transparent outline-none text-sm placeholder:text-gray-500"
+      />
+    </div>
+  );
+
+  const renderFolderRow = (node: FolderNode): React.ReactNode => {
+    const hasChildren = node.children.length > 0;
+    const isExpanded = expandedFolderIds.has(node.id);
+    const isActive = activeFolderId === node.id;
+
+    return (
+      <div key={node.id}>
+        <div
+          onClick={() => openFolder(node.id)}
+          style={{ paddingLeft: folderRowPadding(node.depth) }}
+          className={`pr-2 py-1.5 rounded-md text-sm flex items-center group cursor-pointer ${isActive ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
+        >
+          {hasChildren ? (
+            <button
+              onClick={(e) => { e.stopPropagation(); toggleFolderExpanded(node.id); }}
+              className="w-5 h-5 mr-0.5 flex items-center justify-center rounded hover:bg-gray-200 flex-shrink-0"
+              aria-label={isExpanded ? `Collapse ${node.name}` : `Expand ${node.name}`}
+              aria-expanded={isExpanded}
+            >
+              {isExpanded
+                ? <ChevronDown className="w-3.5 h-3.5" />
+                : <ChevronRight className="w-3.5 h-3.5" />}
+            </button>
+          ) : (
+            <span className="w-[22px] flex-shrink-0" />
+          )}
+          <FolderIcon className="w-4 h-4 mr-2 flex-shrink-0" />
+          <span className="flex-1 min-w-0 truncate">{node.name}</span>
+          {/* group-has keeps the count hidden while the menu is open and the pointer has
+              moved off the row into the portalled menu, which would otherwise show both */}
+          <span className="ml-2 text-xs text-gray-400 group-hover:hidden group-has-[[data-state=open]]:hidden">
+            {node.meeting_count}
+          </span>
+
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                onClick={(e) => e.stopPropagation()}
+                className="hidden group-hover:flex data-[state=open]:flex items-center p-1 rounded-md hover:bg-gray-200 flex-shrink-0"
+                aria-label={`Actions for ${node.name}`}
+              >
+                <MoreHorizontal className="w-3.5 h-3.5" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="end"
+              onClick={(e) => e.stopPropagation()}
+              onCloseAutoFocus={(e) => {
+                if (!suppressMenuRefocus.current) return;
+                suppressMenuRefocus.current = false;
+                e.preventDefault();
+              }}
+            >
+              <DropdownMenuItem
+                onClick={() => {
+                  suppressMenuRefocus.current = true;
+                  startFolderDraft(node.id);
+                }}
+              >
+                <FolderPlus className="w-4 h-4 mr-2" />
+                New subfolder
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => {
+                  setFolderRenameState({ isOpen: true, folderId: node.id });
+                  setRenamingFolderName(node.name);
+                }}
+              >
+                <Pencil className="w-4 h-4 mr-2" />
+                Rename
+              </DropdownMenuItem>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <FolderInput className="w-4 h-4 mr-2" />
+                  Move to
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="max-h-72 overflow-y-auto">
+                  <FolderMoveTargets
+                    folder={node}
+                    folders={folders}
+                    flatFolders={flatFolders}
+                    parentLabels={folderParentLabels}
+                    onMove={handleMoveFolder}
+                  />
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                className="text-red-500 focus:text-red-500"
+                onClick={() => requestFolderDelete(node)}
+              >
+                <Trash2 className="w-4 h-4 mr-2" />
+                Delete
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+
+        {isExpanded && node.children.map(renderFolderRow)}
+        {folderDraft?.parentId === node.id && renderFolderDraft(node.depth + 1)}
+      </div>
+    );
   };
 
   // Expose setShowModelSettings to window for Rust tray to call
@@ -477,7 +775,7 @@ const Sidebar: React.FC = () => {
             {!isCollapsed && (
               <div
                 onClick={() => router.push('/')}
-                className="px-3 text-sm font-medium text-gray-700 items-center hover:bg-gray-100 h-9 flex mx-3 mt-2 rounded-lg cursor-pointer"
+                className="px-3 text-sm font-medium text-gray-700 items-center hover:bg-gray-100 h-8 flex mx-3 mt-2 rounded-lg cursor-pointer"
               >
                 <Home className="w-4 h-4 mr-2" />
                 <span>Home</span>
@@ -527,7 +825,7 @@ const Sidebar: React.FC = () => {
                     {/* All Notes */}
                     <div
                       onClick={openAllNotes}
-                      className={`px-3 text-sm font-medium text-gray-700 items-center h-9 flex mx-3 mt-1 rounded-lg cursor-pointer ${pathname === '/notes' && !activeFolderId && !isUncategorizedActive ? 'bg-gray-100' : 'hover:bg-gray-100'}`}
+                      className={`px-3 text-sm font-medium text-gray-700 items-center h-8 flex mx-3 mt-0.5 rounded-lg cursor-pointer ${pathname === '/notes' && !activeFolderId && !isUncategorizedActive ? 'bg-gray-100' : 'hover:bg-gray-100'}`}
                     >
                       <NotebookPen className="w-4 h-4 mr-2" />
                       <span>All Notes</span>
@@ -536,17 +834,17 @@ const Sidebar: React.FC = () => {
                     {/* Chat */}
                     <div
                       onClick={() => router.push('/chat')}
-                      className={`px-3 text-sm font-medium text-gray-700 items-center h-9 flex mx-3 mt-1 rounded-lg cursor-pointer ${pathname === '/chat' ? 'bg-gray-100' : 'hover:bg-gray-100'}`}
+                      className={`px-3 text-sm font-medium text-gray-700 items-center h-8 flex mx-3 mt-0.5 rounded-lg cursor-pointer ${pathname === '/chat' ? 'bg-gray-100' : 'hover:bg-gray-100'}`}
                     >
                       <MessageCircle className="w-4 h-4 mr-2" />
                       <span>Chat</span>
                     </div>
 
                     {/* Virtual folder for meetings that have not been assigned to a folder */}
-                    <div className="mx-3 mt-1">
+                    <div className="mx-3 mt-0.5">
                       <div
                         onClick={openUncategorized}
-                        className={`px-3 py-2 my-0.5 rounded-md text-sm flex items-center group cursor-pointer ${isUncategorizedActive ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
+                        className={`px-3 py-1.5 rounded-md text-sm flex items-center group cursor-pointer ${isUncategorizedActive ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
                       >
                         <FolderIcon className="w-4 h-4 mr-2 flex-shrink-0" />
                         <span className="flex-1 min-w-0 truncate">Uncategorized</span>
@@ -555,10 +853,10 @@ const Sidebar: React.FC = () => {
                     </div>
 
                     {/* Folders */}
-                    <div className="mx-3 mt-4 px-3 flex items-center justify-between text-xs font-semibold uppercase tracking-wider text-gray-400">
+                    <div className="mx-3 mt-3 px-3 flex items-center justify-between text-xs font-semibold uppercase tracking-wider text-gray-400">
                       <span>Folders</span>
                       <button
-                        onClick={() => setIsCreatingFolder(true)}
+                        onClick={() => startFolderDraft(null)}
                         className="p-1 -mr-1 rounded hover:bg-gray-100 hover:text-gray-600 transition-colors"
                         aria-label="New folder"
                       >
@@ -566,61 +864,12 @@ const Sidebar: React.FC = () => {
                       </button>
                     </div>
 
-                    <div className="mx-3 mt-1">
-                      {folders.map(folder => (
-                        <div
-                          key={folder.id}
-                          onClick={() => openFolder(folder.id)}
-                          className={`px-3 py-2 my-0.5 rounded-md text-sm flex items-center group cursor-pointer ${activeFolderId === folder.id ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-100'}`}
-                        >
-                          <FolderIcon className="w-4 h-4 mr-2 flex-shrink-0" />
-                          <span className="flex-1 min-w-0 truncate">{folder.name}</span>
-                          <span className="ml-2 text-xs text-gray-400 group-hover:hidden">{folder.meeting_count}</span>
-                          <div className="hidden group-hover:flex items-center gap-1">
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setFolderRenameState({ isOpen: true, folderId: folder.id });
-                                setRenamingFolderName(folder.name);
-                              }}
-                              className="hover:text-blue-600 p-1 rounded-md hover:bg-blue-50 flex-shrink-0"
-                              aria-label="Rename folder"
-                            >
-                              <Pencil className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setFolderDeleteState({ isOpen: true, folderId: folder.id });
-                              }}
-                              className="hover:text-red-600 p-1 rounded-md hover:bg-red-50 flex-shrink-0"
-                              aria-label="Delete folder"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        </div>
-                      ))}
+                    <div className="mx-3 mt-0.5">
+                      {folderTree.map(renderFolderRow)}
 
-                      {isCreatingFolder && (
-                        <div className="px-3 py-2 my-0.5 rounded-md text-sm flex items-center bg-gray-100">
-                          <FolderIcon className="w-4 h-4 mr-2 flex-shrink-0 text-gray-500" />
-                          <input
-                            autoFocus
-                            value={newFolderName}
-                            onChange={(e) => setNewFolderName(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') handleCreateFolder();
-                              if (e.key === 'Escape') { setIsCreatingFolder(false); setNewFolderName(''); }
-                            }}
-                            onBlur={handleCreateFolder}
-                            placeholder="Folder name"
-                            className="flex-1 min-w-0 bg-transparent outline-none text-sm placeholder:text-gray-500"
-                          />
-                        </div>
-                      )}
+                      {folderDraft?.parentId === null && renderFolderDraft(0)}
 
-                      {folders.length === 0 && !isCreatingFolder && (
+                      {folders.length === 0 && !folderDraft && (
                         <div className="px-3 py-2 text-xs text-gray-500">
                           No folders yet — create one to organize your meetings.
                         </div>
@@ -637,44 +886,40 @@ const Sidebar: React.FC = () => {
         {!isCollapsed && (
 
           <div className="flex-shrink-0 p-2 border-t border-gray-100">
-            <button
-              onClick={handleRecordingToggle}
-              disabled={isRecording}
-              className={`w-full flex items-center justify-center px-3 py-2 text-sm font-medium text-white ${isRecording ? 'bg-red-300 cursor-not-allowed' : 'bg-red-500 hover:bg-red-600'} rounded-lg transition-colors shadow-sm`}
-            >
-              {isRecording ? (
-                <>
-                  <Square className="w-4 h-4 mr-2" />
-                  <span>Recording in progress...</span>
-                </>
-              ) : (
-                <>
-                  <Mic className="w-4 h-4 mr-2" />
-                  <span>Start Recording</span>
-                </>
-              )}
-            </button>
-
-            {betaFeatures.importAndRetranscribe && (
+            {/* One tight icon row instead of stacked full-width buttons, centred so it
+                stays put at any sidebar width */}
+            <div className="flex items-center justify-center gap-1">
               <button
-                onClick={() => openImportDialog()}
-                className="w-full flex items-center justify-center px-3 py-2 mt-1 text-sm font-medium text-gray-700 bg-blue-100 hover:bg-blue-200 rounded-lg transition-colors shadow-sm"
+                onClick={handleRecordingToggle}
+                disabled={isRecording}
+                title={isRecording ? 'Recording in progress' : 'Start recording'}
+                aria-label={isRecording ? 'Recording in progress' : 'Start recording'}
+                className={`w-8 h-8 flex items-center justify-center text-white ${isRecording ? 'bg-red-300 cursor-not-allowed' : 'bg-red-500 hover:bg-red-600'} rounded-lg transition-colors shadow-sm`}
               >
-                <Upload className="w-4 h-4 mr-2" />
-                <span>Import Audio</span>
+                {isRecording ? <Square className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
               </button>
-            )}
 
-            <button
-              onClick={() => router.push('/settings')}
-              className="w-full flex items-center justify-center px-3 py-1.5 mt-1 mb-1 text-sm font-medium text-gray-700 bg-gray-200 hover:bg-gray-300 rounded-lg transition-colors shadow-sm"
-            >
-              <Settings className="w-4 h-4 mr-2" />
-              <span>Settings</span>
-            </button>
-            <Info isCollapsed={isCollapsed} />
-            <div className="w-full flex items-center justify-center px-3 py-1 text-xs text-gray-400">
-              v0.4.0
+              {betaFeatures.importAndRetranscribe && (
+                <button
+                  onClick={() => openImportDialog()}
+                  title="Import audio"
+                  aria-label="Import audio"
+                  className="w-8 h-8 flex items-center justify-center text-gray-700 bg-blue-100 hover:bg-blue-200 rounded-lg transition-colors shadow-sm"
+                >
+                  <Upload className="w-4 h-4" />
+                </button>
+              )}
+
+              <button
+                onClick={() => router.push('/settings')}
+                title="Settings"
+                aria-label="Settings"
+                className="w-8 h-8 flex items-center justify-center text-gray-700 bg-gray-200 hover:bg-gray-300 rounded-lg transition-colors shadow-sm"
+              >
+                <Settings className="w-4 h-4" />
+              </button>
+
+              <Info isCollapsed={isCollapsed} iconOnly />
             </div>
           </div>
         )}

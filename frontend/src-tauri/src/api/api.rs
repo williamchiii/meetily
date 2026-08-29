@@ -373,10 +373,12 @@ pub async fn api_get_folders(
     })
 }
 
+/// Create a folder, nested inside `parent_id` when one is given.
 #[tauri::command]
 pub async fn api_create_folder(
     state: tauri::State<'_, AppState>,
     name: String,
+    parent_id: Option<String>,
 ) -> Result<FolderWithCount, String> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -387,10 +389,10 @@ pub async fn api_create_folder(
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = chrono::Utc::now().to_rfc3339();
 
-    FoldersRepository::create_folder(pool, &id, &name, &created_at)
+    FoldersRepository::create_folder(pool, &id, &name, &created_at, parent_id.as_deref())
         .await
         .map_err(|e| {
-            log_error!("Error creating folder: {}", e);
+            log_error!("Error creating folder: {:?}", e);
             e.to_string()
         })?;
 
@@ -398,8 +400,25 @@ pub async fn api_create_folder(
         id,
         name,
         created_at,
+        parent_id,
         meeting_count: 0,
     })
+}
+
+/// Reparent a folder. A `None` parent moves it back to the top level.
+#[tauri::command]
+pub async fn api_move_folder(
+    state: tauri::State<'_, AppState>,
+    folder_id: String,
+    parent_id: Option<String>,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    FoldersRepository::move_folder(pool, &folder_id, parent_id.as_deref())
+        .await
+        .map_err(|e| {
+            log_error!("Error moving folder {}: {:?}", folder_id, e);
+            e.to_string()
+        })
 }
 
 #[tauri::command]
@@ -428,24 +447,19 @@ pub async fn api_rename_folder(
     }
 }
 
+/// Delete a folder. Refused while it still has subfolders; its own meetings become unfiled.
 #[tauri::command]
 pub async fn api_delete_folder(
     state: tauri::State<'_, AppState>,
     folder_id: String,
 ) -> Result<(), String> {
     let pool = state.db_manager.pool();
-    let deleted = FoldersRepository::delete_folder(pool, &folder_id)
+    FoldersRepository::delete_folder(pool, &folder_id)
         .await
         .map_err(|e| {
-            log_error!("Error deleting folder {}: {}", folder_id, e);
+            log_error!("Error deleting folder {}: {:?}", folder_id, e);
             e.to_string()
-        })?;
-
-    if deleted {
-        Ok(())
-    } else {
-        Err("Folder not found".to_string())
-    }
+        })
 }
 
 #[tauri::command]

@@ -635,6 +635,7 @@ pub fn run() {
             api::api_get_folders,
             api::api_create_folder,
             api::api_rename_folder,
+            api::api_move_folder,
             api::api_delete_folder,
             api::api_set_meeting_folder,
             api::api_search_transcripts,

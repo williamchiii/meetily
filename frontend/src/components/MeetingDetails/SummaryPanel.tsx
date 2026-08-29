@@ -14,6 +14,7 @@ import { toast } from 'sonner';
 import { Languages, ChevronDown, PanelLeftClose, PanelLeftOpen, CalendarDays, Folder as FolderIcon } from 'lucide-react';
 import { format } from 'date-fns';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
+import { folderPathLabel } from '@/lib/folderTree';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { LanguagePickerPopover } from '@/components/LanguagePickerPopover';
@@ -264,8 +265,9 @@ export function SummaryPanel({
   const meetingDateLabel =
     meetingDate && !isNaN(meetingDate.getTime()) ? format(meetingDate, 'EEE, MMM d · h:mm a') : null;
   const meetingFolderId = sidebarMeetings.find(m => m.id === meeting.id)?.folder_id;
+  // Full path, not the leaf name: sibling branches may both end in "Acme"
   const meetingFolderName = meetingFolderId
-    ? sidebarFolders.find(f => f.id === meetingFolderId)?.name ?? null
+    ? folderPathLabel(sidebarFolders, meetingFolderId) || null
     : null;
 
   // Granola-style centered header: big editable title + quiet meta chips
@@ -286,9 +288,13 @@ export function SummaryPanel({
           </span>
         )}
         {meetingFolderName && (
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-gray-200 bg-gray-50">
-            <FolderIcon className="w-3.5 h-3.5" />
-            {meetingFolderName}
+          <span
+            className="inline-flex items-center gap-1.5 max-w-[16rem] px-2.5 py-1 rounded-full border border-gray-200 bg-gray-50"
+            title={meetingFolderName}
+          >
+            <FolderIcon className="w-3.5 h-3.5 flex-shrink-0" />
+            {/* A deep path would otherwise push the other meta chips out of the header */}
+            <span className="truncate">{meetingFolderName}</span>
           </span>
         )}
       </div>

@@ -19,8 +19,14 @@ export interface Folder {
   id: string;
   name: string;
   created_at: string;
+  /** Enclosing folder, or null for a top-level folder. */
+  parent_id: string | null;
+  /** Meetings filed directly in this folder, excluding its subfolders. */
   meeting_count: number;
 }
+
+/** Outcome of a folder mutation that can fail for a reason worth showing the user. */
+export type FolderResult = { ok: true } | { ok: false; error: string };
 
 // Search result type for transcript search
 interface TranscriptSearchResult {
@@ -61,9 +67,10 @@ interface SidebarContextType {
   // Organizational folders
   folders: Folder[];
   refetchFolders: () => Promise<void>;
-  createFolder: (name: string) => Promise<Folder | null>;
+  createFolder: (name: string, parentId?: string | null) => Promise<Folder | null>;
   renameFolder: (folderId: string, name: string) => Promise<boolean>;
-  deleteFolder: (folderId: string) => Promise<boolean>;
+  moveFolder: (folderId: string, parentId: string | null) => Promise<FolderResult>;
+  deleteFolder: (folderId: string) => Promise<FolderResult>;
   moveMeetingToFolder: (meetingId: string, folderId: string | null) => Promise<boolean>;
 }
 
@@ -160,9 +167,9 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     fetchFolders();
   }, [fetchFolders]);
 
-  const createFolder = React.useCallback(async (name: string): Promise<Folder | null> => {
+  const createFolder = React.useCallback(async (name: string, parentId: string | null = null): Promise<Folder | null> => {
     try {
-      const folder = await invoke('api_create_folder', { name }) as Folder;
+      const folder = await invoke('api_create_folder', { name, parentId }) as Folder;
       await fetchFolders();
       return folder;
     } catch (error) {
@@ -182,16 +189,30 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     }
   }, [fetchFolders]);
 
-  const deleteFolder = React.useCallback(async (folderId: string): Promise<boolean> => {
+  // Reparent a folder; null nests it back at the top level. The Rust layer rejects
+  // moves into the folder's own subtree, so surface its message rather than a generic one.
+  const moveFolder = React.useCallback(async (folderId: string, parentId: string | null): Promise<FolderResult> => {
+    try {
+      await invoke('api_move_folder', { folderId, parentId });
+      await fetchFolders();
+      return { ok: true };
+    } catch (error) {
+      console.error('Error moving folder:', error);
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }, [fetchFolders]);
+
+  // Deletion is refused while the folder still has subfolders; the error explains why.
+  const deleteFolder = React.useCallback(async (folderId: string): Promise<FolderResult> => {
     try {
       await invoke('api_delete_folder', { folderId });
       // Meetings in the folder become unfiled; keep local state in sync
       setMeetings(prev => prev.map(m => m.folder_id === folderId ? { ...m, folder_id: null } : m));
       await fetchFolders();
-      return true;
+      return { ok: true };
     } catch (error) {
       console.error('Error deleting folder:', error);
-      return false;
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
   }, [fetchFolders]);
 
@@ -403,6 +424,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       refetchFolders: fetchFolders,
       createFolder,
       renameFolder,
+      moveFolder,
       deleteFolder,
       moveMeetingToFolder,
     }}>
